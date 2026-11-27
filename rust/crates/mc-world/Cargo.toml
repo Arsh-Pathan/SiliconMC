@@ -1,0 +1,18 @@
+[package]
+name = "mc-world"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mc-math.workspace = true
+mc-nbt.workspace = true
+mc-data.workspace = true
+flate2.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+mc-oracle.workspace = true
+serde_json.workspace = true
