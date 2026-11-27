@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod jsonrpc;
 pub mod playerdata;
+pub mod query;
 pub mod rcon;
 pub mod server;
 pub mod world_loader;

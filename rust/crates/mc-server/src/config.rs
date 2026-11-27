@@ -20,6 +20,8 @@ pub struct ServerConfig {
     pub enable_rcon: bool,
     pub rcon_port: u16,
     pub rcon_password: String,
+    pub enable_query: bool,
+    pub query_port: u16,
     pub management_server_enabled: bool,
     pub management_server_port: u16,
     pub management_server_secret: String,
@@ -46,6 +48,8 @@ impl Default for ServerConfig {
             enable_rcon: false,
             rcon_port: 25575,
             rcon_password: String::new(),
+            enable_query: false,
+            query_port: 25565,
             management_server_enabled: false,
             management_server_port: 25585,
             management_server_secret: String::new(),
@@ -195,6 +199,12 @@ impl ServerConfig {
         }
         if let Some(v) = props.get("rcon.password") {
             cfg.rcon_password = v.clone();
+        }
+        if let Some(v) = props.get("enable-query").and_then(|s| s.parse().ok()) {
+            cfg.enable_query = v;
+        }
+        if let Some(v) = props.get("query.port").and_then(|s| s.parse().ok()) {
+            cfg.query_port = v;
         }
         if let Some(v) = props
             .get("management-server-enabled")
