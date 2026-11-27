@@ -1,0 +1,23 @@
+[package]
+name = "mc-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mc-math.workspace = true
+mc-nbt.workspace = true
+mc-data.workspace = true
+mc-world.workspace = true
+aes.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+mc-oracle.workspace = true
