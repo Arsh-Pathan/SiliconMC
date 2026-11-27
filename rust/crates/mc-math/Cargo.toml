@@ -1,0 +1,12 @@
+[package]
+name = "mc-math"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+md-5.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+mc-oracle.workspace = true
+serde_json.workspace = true

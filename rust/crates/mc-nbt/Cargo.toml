@@ -1,0 +1,13 @@
+[package]
+name = "mc-nbt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+indexmap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+mc-oracle.workspace = true
