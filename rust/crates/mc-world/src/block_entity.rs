@@ -28,7 +28,12 @@ pub enum BlockEntityKind {
         items: Vec<ItemStack>, // 5 slots
         transfer_cooldown: i32,
     },
-    /// Lossless pass-through for any other vanilla block entity (signs, spawners, banners, etc.).
+    Sign {
+        front_lines: [String; 4],
+        back_lines: [String; 4],
+        is_waxed: bool,
+    },
+    /// Lossless pass-through for any other vanilla block entity (spawners, banners, etc.).
     Raw {
         id: String,
         nbt: NbtCompound,
@@ -92,6 +97,17 @@ impl BlockEntity {
         }
     }
 
+    pub fn new_sign(pos: BlockPos) -> Self {
+        Self {
+            pos,
+            kind: BlockEntityKind::Sign {
+                front_lines: Default::default(),
+                back_lines: Default::default(),
+                is_waxed: false,
+            },
+        }
+    }
+
     pub fn type_id_str(&self) -> &str {
         match &self.kind {
             BlockEntityKind::Chest { .. } => "minecraft:chest",
@@ -102,6 +118,7 @@ impl BlockEntity {
                 _ => "minecraft:furnace",
             },
             BlockEntityKind::Hopper { .. } => "minecraft:hopper",
+            BlockEntityKind::Sign { .. } => "minecraft:sign",
             BlockEntityKind::Raw { id, .. } => id.as_str(),
         }
     }
@@ -116,6 +133,7 @@ impl BlockEntity {
                 _ => block_entity_types::FURNACE,
             }),
             BlockEntityKind::Hopper { .. } => Some(block_entity_types::HOPPER),
+            BlockEntityKind::Sign { .. } => Some(block_entity_types::SIGN),
             BlockEntityKind::Raw { id, .. } => {
                 mc_data::static_registry_protocol_id("minecraft:block_entity_type", id)
             }
@@ -128,7 +146,7 @@ impl BlockEntity {
             | BlockEntityKind::Barrel { items }
             | BlockEntityKind::Furnace { items, .. }
             | BlockEntityKind::Hopper { items, .. } => Some(items),
-            BlockEntityKind::Raw { .. } => None,
+            BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => None,
         }
     }
 
@@ -138,7 +156,7 @@ impl BlockEntity {
             | BlockEntityKind::Barrel { items }
             | BlockEntityKind::Furnace { items, .. }
             | BlockEntityKind::Hopper { items, .. } => Some(items),
-            BlockEntityKind::Raw { .. } => None,
+            BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => None,
         }
     }
 
@@ -185,7 +203,7 @@ impl BlockEntity {
             BlockEntityKind::Chest { items }
             | BlockEntityKind::Barrel { items }
             | BlockEntityKind::Hopper { items, .. } => (0..items.len()).collect(),
-            BlockEntityKind::Raw { .. } => return false,
+            BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => return false,
         };
         let Some(slots) = self.items_slice_mut() else {
             return false;
@@ -220,7 +238,7 @@ impl BlockEntity {
             BlockEntityKind::Chest { items }
             | BlockEntityKind::Barrel { items }
             | BlockEntityKind::Hopper { items, .. } => (0..items.len()).collect(),
-            BlockEntityKind::Raw { .. } => return None,
+            BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => return None,
         };
         let slots = self.items_slice_mut()?;
         for idx in allowed_slots {
@@ -403,6 +421,15 @@ impl BlockEntity {
                 c.insert("TransferCooldown", NbtTag::Int(*transfer_cooldown));
                 c.insert("Items", save_items_nbt(items));
             }
+            BlockEntityKind::Sign {
+                front_lines,
+                back_lines,
+                is_waxed,
+            } => {
+                c.insert("is_waxed", NbtTag::Byte(if *is_waxed { 1 } else { 0 }));
+                c.insert("front_text", NbtTag::Compound(save_sign_text_nbt(front_lines)));
+                c.insert("back_text", NbtTag::Compound(save_sign_text_nbt(back_lines)));
+            }
             BlockEntityKind::Raw { .. } => unreachable!(),
         }
         c
@@ -445,10 +472,49 @@ impl BlockEntity {
                 items: load_items_nbt(c, 5),
                 transfer_cooldown: c.get_int("TransferCooldown").unwrap_or(0),
             },
+            "minecraft:sign" | "minecraft:hanging_sign" => BlockEntityKind::Sign {
+                front_lines: load_sign_text_nbt(c.get_compound("front_text")),
+                back_lines: load_sign_text_nbt(c.get_compound("back_text")),
+                is_waxed: c.get_byte("is_waxed").unwrap_or(0) != 0,
+            },
             _ => BlockEntityKind::Raw { id, nbt: c.clone() },
         };
         Some(Self { pos, kind })
     }
+}
+
+fn save_sign_text_nbt(lines: &[String; 4]) -> NbtCompound {
+    let mut c = NbtCompound::new();
+    c.insert("has_glowing_text", NbtTag::Byte(0));
+    c.insert("color", NbtTag::String("black".into()));
+    c.insert(
+        "messages",
+        NbtTag::List(
+            lines
+                .iter()
+                .map(|l| NbtTag::String(l.clone()))
+                .collect(),
+        ),
+    );
+    c
+}
+
+fn load_sign_text_nbt(opt: Option<&NbtCompound>) -> [String; 4] {
+    let mut out: [String; 4] = Default::default();
+    if let Some(c) = opt {
+        if let Some(list) = c.get_list("messages") {
+            for (i, tag) in list.iter().take(4).enumerate() {
+                if let NbtTag::String(s) = tag {
+                    out[i] = s.clone();
+                } else if let Some(comp) = tag.as_compound() {
+                    if let Some(txt) = comp.get_string("text") {
+                        out[i] = txt.to_string();
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn save_items_nbt(items: &[ItemStack]) -> NbtTag {

@@ -97,6 +97,8 @@ def classify_kind(block_name: str, props: dict[str, str]) -> int:
         return 29
     if block_name == "minecraft:end_portal":
         return 30
+    if block_name.endswith("_sign"):
+        return 31
     return 0
 
 
@@ -375,6 +377,7 @@ def main() -> None:
         "pub const KIND_DROPPER: u8 = 28;",
         "pub const KIND_NETHER_PORTAL: u8 = 29;",
         "pub const KIND_END_PORTAL: u8 = 30;",
+        "pub const KIND_SIGN: u8 = 31;",
         "",
         f"pub const WATER_STATES: [u32; 16] = [{', '.join(str(x) for x in water_states)}];",
         f"pub const LAVA_STATES: [u32; 16] = [{', '.join(str(x) for x in lava_states)}];",

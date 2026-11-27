@@ -22,6 +22,12 @@ pub enum EntityKind {
         hurt_ticks: u8,
         wander_dir: (f64, f64),
     },
+    Projectile {
+        kind_name: String,
+        owner_eid: i32,
+        age: u16,
+        damage: f32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +50,12 @@ pub enum EntityTickOutcome {
     Alive { moved: bool },
     Despawn,
     LandedFallingBlock { pos: BlockPos, state: BlockStateId },
+    ProjectileHit {
+        hit_pos: Vec3,
+        kind_name: String,
+        owner_eid: i32,
+        damage: f32,
+    },
 }
 
 impl WorldEntity {
@@ -126,9 +138,46 @@ impl WorldEntity {
         })
     }
 
+    pub fn spawn_projectile(
+        entity_id: i32,
+        kind_name: &str,
+        owner_eid: i32,
+        pos: Vec3,
+        yaw: f32,
+        pitch: f32,
+        speed: f64,
+        damage: f32,
+    ) -> Option<Self> {
+        let entity_type_id = static_registry_protocol_id("minecraft:entity_type", kind_name)?;
+        let yr = (yaw as f64).to_radians();
+        let pr = (pitch as f64).to_radians();
+        let vx = -yr.sin() * pr.cos() * speed;
+        let vy = -pr.sin() * speed;
+        let vz = yr.cos() * pr.cos() * speed;
+        Some(Self {
+            entity_id,
+            uuid: Uuid::new_v4(),
+            entity_type_id,
+            pos,
+            vel: Vec3::new(vx, vy, vz),
+            yaw,
+            pitch,
+            on_ground: false,
+            half_width: 0.125,
+            height: 0.25,
+            kind: EntityKind::Projectile {
+                kind_name: kind_name.to_string(),
+                owner_eid,
+                age: 0,
+                damage,
+            },
+        })
+    }
+
     pub fn add_entity_data_field(&self) -> i32 {
         match &self.kind {
             EntityKind::FallingBlock { block_state, .. } => block_state.0 as i32,
+            EntityKind::Projectile { owner_eid, .. } => *owner_eid,
             _ => 0,
         }
     }
@@ -195,6 +244,13 @@ impl WorldEntity {
                 }
                 -0.08
             }
+            EntityKind::Projectile { age, .. } => {
+                *age += 1;
+                if *age > 400 || self.pos.y < -128.0 {
+                    return EntityTickOutcome::Despawn;
+                }
+                -0.03
+            }
         };
 
         self.vel.y += gravity;
@@ -212,6 +268,22 @@ impl WorldEntity {
 
         let hit_x = self.move_axis(world, 0, self.vel.x);
         let hit_z = self.move_axis(world, 2, self.vel.z);
+        if let EntityKind::Projectile {
+            ref kind_name,
+            owner_eid,
+            damage,
+            ..
+        } = self.kind
+        {
+            if hit_x || hit_y || hit_z {
+                return EntityTickOutcome::ProjectileHit {
+                    hit_pos: self.pos,
+                    kind_name: kind_name.clone(),
+                    owner_eid,
+                    damage,
+                };
+            }
+        }
         if hit_x {
             self.vel.x = 0.0;
         }
