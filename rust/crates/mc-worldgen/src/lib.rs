@@ -1,4 +1,5 @@
 pub mod aquifer;
+pub mod carvers;
 pub mod climate;
 pub mod density;
 pub mod dimensions;
@@ -8,11 +9,14 @@ pub mod generated_nether;
 pub mod generated_overworld;
 pub mod material;
 pub mod noise;
+pub mod structures;
 
 pub use aquifer::*;
+pub use carvers::*;
 pub use climate::*;
 pub use density::*;
 pub use dimensions::*;
 pub use features::*;
 pub use material::*;
 pub use noise::*;
+pub use structures::*;

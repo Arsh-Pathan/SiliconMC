@@ -851,6 +851,15 @@ impl OverworldGenerator {
             block_entities: BTreeMap::new(),
             dirty: false,
         };
+        // 6. Carve classic vanilla caves & canyons and spawn natural 26.3 .nbt structures
+        crate::carvers::carve_overworld_chunk(&mut chunk, self.seed);
+        let center_biome = OVERWORLD_BIOME_NAMES[quart_biomes_ow_idx[8 * 64 + (2 << 2) + 2] as usize];
+        crate::structures::place_natural_overworld_structures(
+            &mut chunk,
+            self.seed,
+            center_biome,
+            &datapacks.data_dir,
+        );
         chunk.recalc_all_heightmaps();
         LightEngine::compute_initial_chunk_light(&mut chunk);
         chunk

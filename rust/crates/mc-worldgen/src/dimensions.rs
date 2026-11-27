@@ -44,6 +44,7 @@ fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
 
 /// Complete Minecraft 26.3 Nether terrain, biome, and MaterialSystem generator.
 pub struct NetherGenerator {
+    pub seed: i64,
     base_noise: BlendedNoise,
     temp_noise: NoiseStack,
     veg_noise: NoiseStack,
@@ -89,6 +90,7 @@ impl NetherGenerator {
             .0;
 
         Self {
+            seed,
             base_noise,
             temp_noise,
             veg_noise,
@@ -450,6 +452,14 @@ impl NetherGenerator {
             block_entities: BTreeMap::new(),
             dirty: false,
         };
+        crate::carvers::carve_nether_chunk(&mut chunk, self.seed);
+        let center_biome = NETHER_BIOME_NAMES[col_biomes[2 * 4 + 2] as usize];
+        crate::structures::place_natural_nether_structures(
+            &mut chunk,
+            self.seed,
+            center_biome,
+            &datapacks.data_dir,
+        );
         chunk.recalc_all_heightmaps();
         LightEngine::compute_initial_chunk_light(&mut chunk);
         chunk
