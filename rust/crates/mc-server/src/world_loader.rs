@@ -85,6 +85,8 @@ pub struct WorldStore {
     pub rain_time: i32,
     pub thundering: bool,
     pub thunder_time: i32,
+    pub difficulty: i32,
+    pub gamerules: crate::gamerules::GameRuleStore,
     generator: Option<OverworldGenerator>,
     nether_generator: NetherGenerator,
     end_generator: EndGenerator,
@@ -110,12 +112,14 @@ impl WorldStore {
         let mut rain_time = 24000i32;
         let mut thundering = false;
         let mut thunder_time = 24000i32;
+        let mut difficulty = 2i32; // Normal
+        let mut gamerules = crate::gamerules::GameRuleStore::new();
         let mut loaded_level_dat = false;
 
         let level_dat = world_dir.join("level.dat");
         if level_dat.is_file() {
-            match Self::read_level_dat(&level_dat) {
-                Ok((sp, s, gt, dt, r, rt, th, tht)) => {
+            match Self::read_level_dat(&level_dat, &mut gamerules) {
+                Ok((sp, s, gt, dt, r, rt, th, tht, diff)) => {
                     spawn_pos = sp;
                     seed = s;
                     game_time = gt;
@@ -124,6 +128,7 @@ impl WorldStore {
                     rain_time = rt;
                     thundering = th;
                     thunder_time = tht;
+                    difficulty = diff;
                     loaded_level_dat = true;
                     info!(
                         "Loaded level.dat from {}: seed={}, spawn=({}, {}, {})",
@@ -175,6 +180,8 @@ impl WorldStore {
             rain_time,
             thundering,
             thunder_time,
+            difficulty,
+            gamerules,
             generator,
             nether_generator: NetherGenerator::new(seed),
             end_generator: EndGenerator::new(seed),
@@ -188,7 +195,10 @@ impl WorldStore {
         &self.world_dir
     }
 
-    fn read_level_dat(path: &Path) -> Result<(BlockPos, i64, i64, i64, bool, i32, bool, i32), String> {
+    fn read_level_dat(
+        path: &Path,
+        gamerules: &mut crate::gamerules::GameRuleStore,
+    ) -> Result<(BlockPos, i64, i64, i64, bool, i32, bool, i32, i32), String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let mut gz = GzDecoder::new(file);
         let mut raw = Vec::new();
@@ -210,6 +220,13 @@ impl WorldStore {
         let rain_time = data.get_int("rainTime").unwrap_or(24000);
         let thundering = data.get_byte("thundering").unwrap_or(0) != 0;
         let thunder_time = data.get_int("thunderTime").unwrap_or(24000);
+        let difficulty = data.get_byte("Difficulty").map(|b| b as i32).unwrap_or(2);
+        if let Some(gr) = data
+            .get_compound("game_rules")
+            .or_else(|| data.get_compound("GameRules"))
+        {
+            gamerules.load_from_nbt(gr);
+        }
         Ok((
             BlockPos::new(sx, sy, sz),
             seed,
@@ -219,6 +236,7 @@ impl WorldStore {
             rain_time,
             thundering,
             thunder_time,
+            difficulty,
         ))
     }
 
@@ -264,6 +282,8 @@ impl WorldStore {
             NbtTag::Byte(if self.thundering { 1 } else { 0 }),
         );
         data.insert("thunderTime", NbtTag::Int(self.thunder_time));
+        data.insert("Difficulty", NbtTag::Byte(self.difficulty as i8));
+        data.insert("game_rules", NbtTag::Compound(self.gamerules.save_to_nbt()));
         data.insert("WorldGenSettings", NbtTag::Compound(wgs));
 
         let mut root = NbtCompound::new();

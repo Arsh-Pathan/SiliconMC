@@ -1206,6 +1206,157 @@ async fn e2e_status_login_config_play_chunks_movement_and_chat() {
         assert!(stat_text.contains("Alice"), "Missing Alice player in UDP Query: {stat_text}");
     }
 
+    // 12. Full-Parity Live E2E: GameRules, Difficulty, Scoreboards, BossBars, Titles, /fill, TNT Explode & Advancements!
+    c1.write_raw_packet(&encode_serverbound_chat_command("gamerule keepInventory true"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("difficulty hard"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("scoreboard objectives add kills dummy Kills"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("scoreboard objectives setdisplay sidebar kills"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("scoreboard players set Alice kills 42"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("bossbar add dragon EnderDragon"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("bossbar set dragon value 50"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("title title SiliconMC263"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("fill 20 -60 20 21 -60 21 obsidian"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("setblock 25 -60 25 tnt"))
+        .await
+        .unwrap();
+    let flint_item = ItemStack::from_name("minecraft:flint_and_steel", 1).unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &flint_item))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(25, -60, 25),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 1.0,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        111,
+    ))
+    .await
+    .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("give diamond 1"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("save-all"))
+        .await
+        .unwrap();
+
+    let mut got_diff = false;
+    let mut got_obj = false;
+    let mut got_disp_obj = false;
+    let mut got_score = false;
+    let mut got_boss = false;
+    let mut got_title = false;
+    let mut got_explode = false;
+    let mut got_adv_chat = false;
+    for _ in 0..300 {
+        let raw = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            c1.read_raw_packet(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::CHANGE_DIFFICULTY {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:change_difficulty");
+            assert_eq!(reenc, raw);
+            got_diff = true;
+        } else if pid == packet_ids::play::clientbound::SET_OBJECTIVE {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:set_objective");
+            assert_eq!(reenc, raw);
+            got_obj = true;
+        } else if pid == packet_ids::play::clientbound::SET_DISPLAY_OBJECTIVE {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:set_display_objective");
+            assert_eq!(reenc, raw);
+            got_disp_obj = true;
+        } else if pid == packet_ids::play::clientbound::SET_SCORE {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:set_score");
+            assert_eq!(reenc, raw);
+            got_score = true;
+        } else if pid == packet_ids::play::clientbound::BOSS_EVENT {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:boss_event");
+            assert_eq!(reenc, raw);
+            got_boss = true;
+        } else if pid == packet_ids::play::clientbound::SET_TITLE_TEXT {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:set_title_text");
+            assert_eq!(reenc, raw);
+            got_title = true;
+        } else if pid == packet_ids::play::clientbound::EXPLODE {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:explode");
+            assert_eq!(reenc, raw);
+            got_explode = true;
+        } else if pid == packet_ids::play::clientbound::SYSTEM_CHAT {
+            if let Ok(mc_nbt::NbtTag::String(s)) = r.read_nbt_network() {
+                if s.contains("has made the advancement [Diamonds!]") {
+                    got_adv_chat = true;
+                }
+            }
+        }
+        if got_diff
+            && got_obj
+            && got_disp_obj
+            && got_score
+            && got_boss
+            && got_title
+            && got_explode
+            && got_adv_chat
+        {
+            break;
+        }
+    }
+    assert!(got_diff, "Expected ClientboundChangeDifficultyPacket");
+    assert!(got_obj, "Expected ClientboundSetObjectivePacket");
+    assert!(got_disp_obj, "Expected ClientboundSetDisplayObjectivePacket");
+    assert!(got_score, "Expected ClientboundSetScorePacket");
+    assert!(got_boss, "Expected ClientboundBossEventPacket");
+    assert!(got_title, "Expected ClientboundSetTitleTextPacket");
+    assert!(got_explode, "Expected ClientboundExplodePacket from TNT ignition");
+    assert!(got_adv_chat, "Expected Diamonds! advancement broadcast");
+
+    // Verify advancements JSON persisted cleanly on disk
+    let adv_file = e2e_world
+        .join("advancements")
+        .join(format!("{alice_uuid}.json"));
+    assert!(adv_file.is_file(), "Advancements JSON not saved for Alice!");
+
     let _ = shutdown_tx.send(());
     let _ = server_task.await;
     let _ = std::fs::remove_dir_all(e2e_world);

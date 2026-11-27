@@ -1,11 +1,15 @@
 pub mod admin;
+pub mod advancements;
 pub mod auth;
 pub mod commands;
 pub mod config;
+pub mod extra_commands;
+pub mod gamerules;
 pub mod jsonrpc;
 pub mod playerdata;
 pub mod query;
 pub mod rcon;
+pub mod scoreboard;
 pub mod server;
 pub mod world_loader;
 

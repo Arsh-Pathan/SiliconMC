@@ -88,6 +88,19 @@ pub fn build_commands_packet() -> Vec<u8> {
         CommandNodeEntry::literal("effect", false, vec![45]),
         CommandNodeEntry::argument("args", CommandArgType::GreedyPhrase, true, vec![]),
     ];
+    let mut nodes = nodes;
+    for &extra_name in crate::extra_commands::EXTRA_COMMAND_NAMES {
+        let lit_idx = nodes.len() as i32;
+        let arg_idx = lit_idx + 1;
+        nodes[0].children.push(lit_idx);
+        nodes.push(CommandNodeEntry::literal(extra_name, true, vec![arg_idx]));
+        nodes.push(CommandNodeEntry::argument(
+            "args",
+            CommandArgType::GreedyPhrase,
+            true,
+            vec![],
+        ));
+    }
     encode_play_commands(&nodes, 0)
 }
 

@@ -1,11 +1,14 @@
 use crate::admin::AdminStore;
+use crate::advancements::PlayerAdvancements;
 use crate::auth::{ServerKeypair, verify_mojang_session};
 use crate::commands::{self, CommandAction};
 use crate::config::ServerConfig;
+use crate::extra_commands::{BossBarProperty, ExtraCommandAction, FillMode, TitleSlot, parse_extra_command};
 use crate::jsonrpc::JsonRpcServer;
 use crate::playerdata::{SavedPlayerData, add_experience_points, load_player_data, save_player_data};
 use crate::query::{QueryServer, QuerySnapshot};
 use crate::rcon::RconServer;
+use crate::scoreboard::ScoreboardStore;
 use crate::world_loader::{DimensionId, WorldStore};
 use anyhow::Result;
 use mc_data::block_behaviors::{
@@ -13,6 +16,8 @@ use mc_data::block_behaviors::{
     KIND_FURNACE, KIND_HOPPER, KIND_NETHER_PORTAL, KIND_SIGN, KIND_SMOKER, block_behavior,
     resolve_placement,
 };
+use mc_data::block_extra::{FIRE_STATE_ID, is_tnt};
+use mc_data::gameplay_tables::enchantment_by_id;
 use mc_data::items::item_by_id;
 use mc_data::loot_and_tools::{block_loot, entity_loot, item_combat_stats};
 use mc_data::recipes::{block_entity_types, food_info, menu_types};
@@ -22,32 +27,45 @@ use mc_data::{
 };
 use mc_math::{BlockPos, ChunkPos, Vec3};
 use mc_proto::{
-    ClientCommandAction, ClientIntent, ConfigServerbound, EntityDataValue, FramedConnection,
-    GameProfile, HandshakeIntention, InteractionHand, KnownPack, LoginServerbound,
-    PackedRegistryEntry, PlayLoginPacket, PlayRespawnPacket, PlayServerbound, PlayerActionType,
-    StatusServerbound, encode_config_custom_payload_brand, encode_config_finish,
+    BossBarColor, BossBarOverlay, ClientCommandAction, ClientIntent, ConfigServerbound, Difficulty,
+    DisplaySlot, EntityDataValue, EquipmentSlot, FramedConnection, GameProfile, HandshakeIntention,
+    InteractionHand, KnownPack, LoginServerbound, ObjectiveMethod, ObjectiveRenderType,
+    PackedRegistryEntry, PlayExtraServerbound, PlayLoginPacket, PlayRespawnPacket, PlayServerbound,
+    PlayerActionType, PlayerTeamParams, StatusServerbound, SwingAnimationType, TeamCollisionRule,
+    TeamColor, TeamVisibility, encode_config_custom_payload_brand, encode_config_finish,
     encode_config_registry_data, encode_config_select_known_packs, encode_config_update_tags_raw,
     encode_login_compression, encode_login_disconnect, encode_login_finished, encode_login_hello,
     encode_play_add_entity, encode_play_block_changed_ack, encode_play_block_entity_data,
-    encode_play_block_update, encode_play_chunk_batch_finished, encode_play_chunk_batch_start,
+    encode_play_block_update, encode_play_boss_event_add, encode_play_boss_event_remove,
+    encode_play_boss_event_update_name, encode_play_boss_event_update_progress,
+    encode_play_boss_event_update_style, encode_play_change_difficulty,
+    encode_play_chunk_batch_finished, encode_play_chunk_batch_start, encode_play_clear_titles,
     encode_play_container_close, encode_play_container_set_content,
     encode_play_container_set_data, encode_play_container_set_slot, encode_play_disconnect,
-    encode_play_entity_event, encode_play_entity_position_sync, encode_play_game_event,
-    encode_play_hurt_animation, encode_play_keep_alive, encode_play_level_chunk_with_light,
-    encode_play_level_event, encode_play_light_update, encode_play_open_screen,
-    encode_play_open_sign_editor, encode_play_player_abilities, encode_play_player_info_add,
-    encode_play_player_info_remove, encode_play_player_position, encode_play_remove_entities,
-    encode_play_remove_mob_effect, encode_play_set_chunk_cache_center,
-    encode_play_set_default_spawn, encode_play_set_entity_data, encode_play_set_entity_motion,
-    encode_play_set_experience, encode_play_set_health, encode_play_set_held_slot,
-    encode_play_set_time, encode_play_system_chat, encode_play_take_item_entity,
-    encode_play_update_mob_effect, encode_status_pong, encode_status_response, offline_player_uuid,
+    encode_play_entity_event, encode_play_entity_position_sync, encode_play_explode,
+    encode_play_game_event, encode_play_hurt_animation, encode_play_keep_alive,
+    encode_play_level_chunk_with_light, encode_play_level_event, encode_play_light_update,
+    encode_play_open_screen, encode_play_open_sign_editor, encode_play_player_abilities,
+    encode_play_player_info_add, encode_play_player_info_remove, encode_play_player_position,
+    encode_play_remove_entities, encode_play_remove_mob_effect, encode_play_reset_score,
+    encode_play_set_action_bar_text, encode_play_set_chunk_cache_center,
+    encode_play_set_default_spawn, encode_play_set_display_objective, encode_play_set_entity_data,
+    encode_play_set_entity_motion, encode_play_set_equipment, encode_play_set_experience,
+    encode_play_set_health, encode_play_set_held_slot, encode_play_set_objective,
+    encode_play_set_player_team_create, encode_play_set_player_team_join,
+    encode_play_set_player_team_leave, encode_play_set_player_team_remove, encode_play_set_score,
+    encode_play_set_subtitle_text, encode_play_set_time, encode_play_set_title_text,
+    encode_play_set_titles_animation, encode_play_swing_animation, encode_play_system_chat,
+    encode_play_take_item_entity, encode_play_update_mob_effect, encode_status_pong,
+    encode_status_response, offline_player_uuid, text_component,
 };
 use mc_world::{
     Arena, BlockEntityKind, ContainerClickType, DirtyLightSections, EntityKind, EntityTickOutcome,
     Handle, ItemStack, PlayerInventory, StructureRotation, StructureTemplate, TickScheduler,
-    WorldEntity, apply_container_click, execute_scheduled_tick, interact_block,
-    propagate_neighbor_updates, trigger_pressure_plate,
+    WorldEntity, apply_container_click, compute_and_apply_explosion,
+    compute_entity_explosion_knockback, execute_scheduled_tick, interact_block,
+    propagate_neighbor_updates, run_chunk_random_ticks, trigger_pressure_plate,
+    try_ignite_nether_portal,
 };
 use rand::RngCore;
 use std::collections::HashSet;
@@ -118,6 +136,8 @@ struct PlayerEntity {
     xp_total: i32,
     portal_cooldown: u32,
     effects: Vec<ActiveEffect>,
+    advancements: PlayerAdvancements,
+    spawnpoint: Option<BlockPos>,
     fall_distance: f64,
     dead: bool,
     last_death: Option<(String, BlockPos)>,
@@ -168,6 +188,10 @@ enum TickEvent {
     Packet {
         handle: PlayerHandle,
         packet: PlayServerbound,
+    },
+    ExtraPacket {
+        handle: PlayerHandle,
+        packet: PlayExtraServerbound,
     },
     Disconnect {
         handle: PlayerHandle,
@@ -450,6 +474,7 @@ impl MinecraftServer {
 struct SimState {
     world: WorldStore,
     admin: AdminStore,
+    scoreboard: ScoreboardStore,
     players: Arena<PlayerEntity>,
     entities: Arena<WorldEntity>,
     scheduler: TickScheduler,
@@ -467,7 +492,642 @@ impl SimState {
             if let Err(e) = save_player_data(dir, p.profile.uuid, &p.to_saved_data()) {
                 warn!("Failed saving playerdata for {}: {e}", p.profile.name);
             }
+            if let Err(e) = p.advancements.save(dir) {
+                warn!("Failed saving advancements for {}: {e}", p.profile.name);
+            }
         }
+    }
+
+    fn announce_advancements(&self, player_name: &str, awarded: Vec<(&'static str, &'static str)>) {
+        if awarded.is_empty() || !self.world.gamerules.show_advancement_messages() {
+            return;
+        }
+        for (_, title) in awarded {
+            let msg = format!("{player_name} has made the advancement [{title}]");
+            if let Ok(pkt) = encode_play_system_chat(&msg, false) {
+                for (_, other) in self.players.iter() {
+                    let _ = other.tx.send(pkt.clone());
+                }
+            }
+        }
+    }
+
+    fn trigger_explosion(&mut self, center: Vec3, power: f32, fire: bool) {
+        let break_blocks = self.world.gamerules.tnt_explodes();
+        let seed = (self.world.game_time as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let res = compute_and_apply_explosion(&mut self.world, center, power, fire, break_blocks, seed);
+        let destroyed_count = res.destroyed_blocks.len() as i32;
+
+        let mut changed: Vec<(BlockPos, BlockStateId)> = res
+            .destroyed_blocks
+            .iter()
+            .map(|(bp, _)| (*bp, BlockStateId::AIR))
+            .collect();
+        changed.extend(res.fire_blocks.iter().copied());
+        self.broadcast_block_changes(&changed);
+
+        let particle_id =
+            static_registry_protocol_id("minecraft:particle_type", "minecraft:explosion_emitter")
+                .unwrap_or(0);
+        let sound_id =
+            static_registry_protocol_id("minecraft:sound_event", "minecraft:entity.generic.explode")
+                .unwrap_or(0);
+
+        let phandles: Vec<PlayerHandle> = self.players.iter().map(|(h, _)| h).collect();
+        let mut dmg_targets = Vec::new();
+        for ph in phandles {
+            if let Some(p) = self.players.get(ph) {
+                let kb_opt = compute_entity_explosion_knockback(center, power, p.pos);
+                let kb_vec = kb_opt.map(|(_, v)| v);
+                if let Some((dmg, _)) = kb_opt {
+                    if dmg > 0.0 {
+                        dmg_targets.push((ph, dmg));
+                    }
+                }
+                let pkt = encode_play_explode(
+                    center,
+                    power,
+                    destroyed_count,
+                    kb_vec,
+                    particle_id,
+                    sound_id,
+                    &[],
+                    true,
+                );
+                let _ = p.tx.send(pkt);
+            }
+        }
+        for (ph, dmg) in dmg_targets {
+            self.damage_player(ph, dmg, "blew up");
+        }
+    }
+
+    fn execute_extra_command(&mut self, handle: PlayerHandle, action: ExtraCommandAction) -> String {
+        let mut block_changes: Vec<(BlockPos, BlockStateId)> = Vec::new();
+        let msg = match action {
+            ExtraCommandAction::Reply(s) => s,
+            ExtraCommandAction::Fill {
+                min,
+                max,
+                state,
+                mode,
+            } => {
+                let mut count = 0usize;
+                for y in min.y..=max.y {
+                    for z in min.z..=max.z {
+                        for x in min.x..=max.x {
+                            let is_shell = x == min.x
+                                || x == max.x
+                                || y == min.y
+                                || y == max.y
+                                || z == min.z
+                                || z == max.z;
+                            let bp = BlockPos::new(x, y, z);
+                            let place = match mode {
+                                FillMode::Replace { filter } => {
+                                    if let Some(f) = filter {
+                                        if self.world.get_block(bp).block_name() != f.block_name() {
+                                            continue;
+                                        }
+                                    }
+                                    state
+                                }
+                                FillMode::Keep => {
+                                    if !self.world.get_block(bp).is_air() {
+                                        continue;
+                                    }
+                                    state
+                                }
+                                FillMode::Hollow => {
+                                    if is_shell { state } else { BlockStateId::AIR }
+                                }
+                                FillMode::Outline => {
+                                    if !is_shell {
+                                        continue;
+                                    }
+                                    state
+                                }
+                                FillMode::Destroy => state,
+                            };
+                            if self.world.set_block_and_relight(bp, place).is_some() {
+                                block_changes.push((bp, place));
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                format!("Successfully filled {count} block(s)")
+            }
+            ExtraCommandAction::Clone {
+                src_min,
+                src_max,
+                dst,
+                masked,
+            } => {
+                let mut buf = Vec::new();
+                for y in src_min.y..=src_max.y {
+                    for z in src_min.z..=src_max.z {
+                        for x in src_min.x..=src_max.x {
+                            let st = self.world.get_block(BlockPos::new(x, y, z));
+                            if masked && st.is_air() {
+                                continue;
+                            }
+                            buf.push((
+                                BlockPos::new(
+                                    dst.x + (x - src_min.x),
+                                    dst.y + (y - src_min.y),
+                                    dst.z + (z - src_min.z),
+                                ),
+                                st,
+                            ));
+                        }
+                    }
+                }
+                let count = buf.len();
+                for (bp, st) in buf {
+                    if self.world.set_block_and_relight(bp, st).is_some() {
+                        block_changes.push((bp, st));
+                    }
+                }
+                format!("Successfully cloned {count} block(s)")
+            }
+            ExtraCommandAction::GameRuleList => {
+                let names = self.world.gamerules.list_names();
+                format!("Game rules ({}): {}", names.len(), names.join(", "))
+            }
+            ExtraCommandAction::GameRule { rule, value } => match value {
+                None => match self.world.gamerules.get_str(&rule) {
+                    Some(v) => format!("Gamerule {rule} is currently set to: {v}"),
+                    None => format!("Unknown gamerule: {rule}"),
+                },
+                Some(v) => match self.world.gamerules.set_from_str(&rule, &v) {
+                    Ok(nv) => format!("Gamerule {rule} is now set to: {nv}"),
+                    Err(e) => e,
+                },
+            },
+            ExtraCommandAction::ScoreboardObjectivesList => {
+                let names: Vec<&str> = self
+                    .scoreboard
+                    .list_objectives()
+                    .iter()
+                    .map(|o| o.name.as_str())
+                    .collect();
+                format!("There are {} objective(s): {}", names.len(), names.join(", "))
+            }
+            ExtraCommandAction::ScoreboardObjectivesAdd {
+                name,
+                criteria,
+                display_name,
+            } => {
+                let disp = display_name.unwrap_or_else(|| name.clone());
+                match self
+                    .scoreboard
+                    .add_objective(&name, &criteria, Some(&disp))
+                {
+                    Ok(_) => {
+                        if let Ok(pkt) = encode_play_set_objective(
+                            &name,
+                            ObjectiveMethod::Add,
+                            Some(&text_component(&disp)),
+                            ObjectiveRenderType::Integer,
+                            None,
+                        ) {
+                            for (_, p) in self.players.iter() {
+                                let _ = p.tx.send(pkt.clone());
+                            }
+                        }
+                        format!("Created new objective [{disp}]")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::ScoreboardObjectivesRemove { name } => {
+                match self.scoreboard.remove_objective(&name) {
+                    Ok(_) => {
+                        if let Ok(pkt) = encode_play_set_objective(
+                            &name,
+                            ObjectiveMethod::Remove,
+                            None,
+                            ObjectiveRenderType::Integer,
+                            None,
+                        ) {
+                            for (_, p) in self.players.iter() {
+                                let _ = p.tx.send(pkt.clone());
+                            }
+                        }
+                        format!("Removed objective {name}")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::ScoreboardObjectivesSetDisplay { slot, objective } => {
+                match self
+                    .scoreboard
+                    .set_display_slot(slot, objective.as_deref())
+                {
+                    Ok(()) => {
+                        let dslot = match slot {
+                            0 => DisplaySlot::List,
+                            2 => DisplaySlot::BelowName,
+                            _ => DisplaySlot::Sidebar,
+                        };
+                        let pkt = encode_play_set_display_objective(
+                            dslot,
+                            objective.as_deref().unwrap_or(""),
+                        );
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                        format!(
+                            "Set display slot {slot} to {}",
+                            objective.as_deref().unwrap_or("(cleared)")
+                        )
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::ScoreboardPlayersSet {
+                target,
+                objective,
+                score,
+            } => match self.scoreboard.set_score(&target, &objective, score) {
+                Ok(val) => {
+                    if let Ok(pkt) = encode_play_set_score(&target, &objective, val, None, None) {
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                    }
+                    format!("Set [{objective}] for {target} to {val}")
+                }
+                Err(e) => e,
+            },
+            ExtraCommandAction::ScoreboardPlayersAdd {
+                target,
+                objective,
+                amount,
+            } => match self.scoreboard.add_score(&target, &objective, amount) {
+                Ok(ns) => {
+                    if let Ok(pkt) = encode_play_set_score(&target, &objective, ns, None, None) {
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                    }
+                    format!("Added {amount} to [{objective}] for {target} (now {ns})")
+                }
+                Err(e) => e,
+            },
+            ExtraCommandAction::ScoreboardPlayersRemove {
+                target,
+                objective,
+                amount,
+            } => match self.scoreboard.remove_score(&target, &objective, amount) {
+                Ok(ns) => {
+                    if let Ok(pkt) = encode_play_set_score(&target, &objective, ns, None, None) {
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                    }
+                    format!("Removed {amount} from [{objective}] for {target} (now {ns})")
+                }
+                Err(e) => e,
+            },
+            ExtraCommandAction::ScoreboardPlayersReset { target, objective } => {
+                let _ = self
+                    .scoreboard
+                    .reset_score(&target, objective.as_deref());
+                let pkt = encode_play_reset_score(&target, objective.as_deref());
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(pkt.clone());
+                }
+                format!("Reset score(s) for {target}")
+            }
+            ExtraCommandAction::ScoreboardPlayersGet { target, objective } => {
+                let val = self.scoreboard.get_score(&target, &objective).unwrap_or(0);
+                format!("{target} has {val} [{objective}]")
+            }
+            ExtraCommandAction::TeamList => {
+                let names: Vec<&str> = self
+                    .scoreboard
+                    .list_teams()
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect();
+                format!("There are {} team(s): {}", names.len(), names.join(", "))
+            }
+            ExtraCommandAction::TeamAdd { name, display_name } => {
+                let disp = display_name.unwrap_or_else(|| name.clone());
+                match self.scoreboard.add_team(&name, Some(&disp)) {
+                    Ok(_) => {
+                        let params = PlayerTeamParams {
+                            display_name: text_component(&disp),
+                            player_prefix: text_component(""),
+                            player_suffix: text_component(""),
+                            name_tag_visibility: TeamVisibility::Always,
+                            collision_rule: TeamCollisionRule::Always,
+                            color: Some(TeamColor::White),
+                            options: 0x03,
+                        };
+                        if let Ok(pkt) = encode_play_set_player_team_create(&name, &params, &[]) {
+                            for (_, p) in self.players.iter() {
+                                let _ = p.tx.send(pkt.clone());
+                            }
+                        }
+                        format!("Created team [{disp}]")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::TeamRemove { name } => {
+                match self.scoreboard.remove_team(&name) {
+                    Ok(_) => {
+                        let pkt = encode_play_set_player_team_remove(&name);
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                        format!("Removed team {name}")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::TeamJoin { team, member } => {
+                match self.scoreboard.join_team(&team, &member) {
+                    Ok(()) => {
+                        let pkt = encode_play_set_player_team_join(&team, &[member.as_str()]);
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                        format!("Added {member} to team {team}")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::TeamLeave { member } => {
+                if let Some(old_team) = self
+                    .scoreboard
+                    .team_of_member(&member)
+                    .map(|t| t.name.clone())
+                {
+                    self.scoreboard.leave_team(&member);
+                    let pkt = encode_play_set_player_team_leave(&old_team, &[member.as_str()]);
+                    for (_, p) in self.players.iter() {
+                        let _ = p.tx.send(pkt.clone());
+                    }
+                    format!("Removed {member} from team {old_team}")
+                } else {
+                    format!("{member} is not on any team")
+                }
+            }
+            ExtraCommandAction::TeamModifyColor { team, color } => {
+                if let Some(t) = self.scoreboard.get_team_mut(&team) {
+                    t.color = color;
+                    format!("Updated team {team} color")
+                } else {
+                    format!("Unknown team '{team}'")
+                }
+            }
+            ExtraCommandAction::BossBarList => {
+                let ids: Vec<&str> = self
+                    .scoreboard
+                    .list_bossbars()
+                    .iter()
+                    .map(|b| b.id.as_str())
+                    .collect();
+                format!("There are {} bossbar(s): {}", ids.len(), ids.join(", "))
+            }
+            ExtraCommandAction::BossBarAdd { id, name } => {
+                match self.scoreboard.add_bossbar(&id, &name) {
+                    Ok(bb) => {
+                        let uuid = bb.uuid;
+                        if let Ok(pkt) = encode_play_boss_event_add(
+                            uuid,
+                            &text_component(&name),
+                            0.0,
+                            BossBarColor::White,
+                            BossBarOverlay::Progress,
+                            false,
+                            false,
+                            false,
+                        ) {
+                            for (_, p) in self.players.iter() {
+                                let _ = p.tx.send(pkt.clone());
+                            }
+                        }
+                        format!("Created custom bossbar [{name}]")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::BossBarRemove { id } => {
+                match self.scoreboard.remove_bossbar(&id) {
+                    Ok(removed) => {
+                        let pkt = encode_play_boss_event_remove(removed.uuid);
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(pkt.clone());
+                        }
+                        format!("Removed custom bossbar [{id}]")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::BossBarSet { id, property } => {
+                let res = match &property {
+                    BossBarProperty::Name(n) => self.scoreboard.set_bossbar_name(&id, n),
+                    BossBarProperty::Value(v) => self.scoreboard.set_bossbar_value(&id, *v),
+                    BossBarProperty::Max(m) => self.scoreboard.set_bossbar_max(&id, *m),
+                    BossBarProperty::Visible(vis) => self.scoreboard.set_bossbar_visible(&id, *vis),
+                    BossBarProperty::Color(c) => self.scoreboard.set_bossbar_color(&id, *c),
+                    BossBarProperty::Overlay(ov) => self.scoreboard.set_bossbar_overlay(&id, *ov),
+                };
+                match res {
+                    Ok(bb) => {
+                        let pkt_opt = match property {
+                            BossBarProperty::Name(_) => {
+                                encode_play_boss_event_update_name(bb.uuid, &text_component(&bb.name)).ok()
+                            }
+                            BossBarProperty::Value(_) | BossBarProperty::Max(_) => {
+                                Some(encode_play_boss_event_update_progress(bb.uuid, bb.progress))
+                            }
+                            BossBarProperty::Visible(true) => encode_play_boss_event_add(
+                                bb.uuid,
+                                &text_component(&bb.name),
+                                bb.progress,
+                                int_to_bossbar_color(bb.color),
+                                int_to_bossbar_overlay(bb.overlay),
+                                false,
+                                false,
+                                false,
+                            )
+                            .ok(),
+                            BossBarProperty::Visible(false) => {
+                                Some(encode_play_boss_event_remove(bb.uuid))
+                            }
+                            BossBarProperty::Color(_) | BossBarProperty::Overlay(_) => {
+                                Some(encode_play_boss_event_update_style(
+                                    bb.uuid,
+                                    int_to_bossbar_color(bb.color),
+                                    int_to_bossbar_overlay(bb.overlay),
+                                ))
+                            }
+                        };
+                        if let Some(pkt) = pkt_opt {
+                            for (_, p) in self.players.iter() {
+                                let _ = p.tx.send(pkt.clone());
+                            }
+                        }
+                        format!("Updated bossbar {id}")
+                    }
+                    Err(e) => e,
+                }
+            }
+            ExtraCommandAction::TitleText { slot, text, .. } => {
+                let pkt = match slot {
+                    TitleSlot::Title => encode_play_set_title_text(&text),
+                    TitleSlot::Subtitle => encode_play_set_subtitle_text(&text),
+                    TitleSlot::ActionBar => encode_play_set_action_bar_text(&text),
+                };
+                if let Ok(bytes) = pkt {
+                    for (_, p) in self.players.iter() {
+                        let _ = p.tx.send(bytes.clone());
+                    }
+                }
+                format!("Showing title '{text}'")
+            }
+            ExtraCommandAction::TitleClear { reset, .. } => {
+                let pkt = encode_play_clear_titles(reset);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(pkt.clone());
+                }
+                "Cleared titles".into()
+            }
+            ExtraCommandAction::TitleTimes {
+                fade_in,
+                stay,
+                fade_out,
+                ..
+            } => {
+                let pkt = encode_play_set_titles_animation(fade_in, stay, fade_out);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(pkt.clone());
+                }
+                format!("Updated title display times ({fade_in}, {stay}, {fade_out})")
+            }
+            ExtraCommandAction::ClearInventory {
+                item_id, max_count, ..
+            } => {
+                let mut cleared = 0u32;
+                if let Some(p) = self.players.get_mut(handle) {
+                    let mut rem_cap = max_count.unwrap_or(u32::MAX);
+                    for s in p.inventory.slots.iter_mut() {
+                        if rem_cap == 0 || s.is_empty() {
+                            continue;
+                        }
+                        if item_id.map_or(true, |id| s.item_id == id) {
+                            let take = (s.count as u32).min(rem_cap);
+                            s.count = (s.count as u32 - take) as u8;
+                            if s.count == 0 {
+                                *s = ItemStack::EMPTY;
+                            }
+                            cleared += take;
+                            rem_cap -= take;
+                        }
+                    }
+                    let sid = p.inventory.next_state_id();
+                    let _ = p.tx.send(encode_play_container_set_content(
+                        0,
+                        sid,
+                        &p.inventory.slots,
+                        &p.inventory.carried,
+                    ));
+                }
+                format!("Removed {cleared} item(s) from inventory")
+            }
+            ExtraCommandAction::SetSpawnpoint { pos, .. } => {
+                if let Some(p) = self.players.get_mut(handle) {
+                    p.spawnpoint = Some(pos);
+                }
+                format!("Set spawn point to {}, {}, {}", pos.x, pos.y, pos.z)
+            }
+            ExtraCommandAction::SetWorldSpawn { pos } => {
+                self.world.spawn_pos = pos;
+                let pkt = encode_play_set_default_spawn("minecraft:overworld", pos, 0.0, 0.0);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(pkt.clone());
+                }
+                format!("Set the world spawn point to {}, {}, {}", pos.x, pos.y, pos.z)
+            }
+            ExtraCommandAction::QueryDifficulty => {
+                let label = match self.world.difficulty {
+                    0 => "Peaceful",
+                    1 => "Easy",
+                    3 => "Hard",
+                    _ => "Normal",
+                };
+                format!("The difficulty is {label}")
+            }
+            ExtraCommandAction::SetDifficulty(d) => {
+                self.world.difficulty = d.clamp(0, 3);
+                let diff = Difficulty::from_id(self.world.difficulty).unwrap_or(Difficulty::Normal);
+                let pkt = encode_play_change_difficulty(diff, false);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(pkt.clone());
+                }
+                format!("The difficulty has been set to {diff:?}")
+            }
+            ExtraCommandAction::Enchant {
+                enchantment, level, ..
+            } => {
+                if let Some(spec) = enchantment_by_id(&enchantment) {
+                    let clamped = (level.max(1) as u8).min(spec.max_level);
+                    let awarded = self.players.get_mut(handle).and_then(|p| {
+                        let name = p.profile.name.clone();
+                        p.advancements.check_enchanted_item().map(|a| (name, vec![a]))
+                    });
+                    if let Some((pname, list)) = awarded {
+                        self.announce_advancements(&pname, list);
+                    }
+                    format!("Applied enchantment {} level {clamped}", spec.id)
+                } else {
+                    format!("Unknown enchantment: {enchantment}")
+                }
+            }
+            ExtraCommandAction::Advancement {
+                grant,
+                advancement_id,
+                ..
+            } => {
+                let mut msg_out = String::new();
+                if let Some(p) = self.players.get_mut(handle) {
+                    if grant {
+                        match advancement_id {
+                            None => {
+                                let n = p.advancements.grant_all();
+                                msg_out = format!("Granted {n} advancement(s) to {}", p.profile.name);
+                            }
+                            Some(id) => {
+                                p.advancements.grant_advancement(&id);
+                                msg_out = format!("Granted advancement {id} to {}", p.profile.name);
+                            }
+                        }
+                    } else {
+                        match advancement_id {
+                            None => {
+                                let n = p.advancements.revoke_all();
+                                msg_out = format!("Revoked {n} advancement(s) from {}", p.profile.name);
+                            }
+                            Some(id) => {
+                                p.advancements.revoke(&id);
+                                msg_out = format!("Revoked advancement {id} from {}", p.profile.name);
+                            }
+                        }
+                    }
+                }
+                msg_out
+            }
+        };
+        self.broadcast_block_changes(&block_changes);
+        msg
     }
 
     fn apply_weather(&mut self, raining: bool, thundering: bool, duration_ticks: i32) {
@@ -735,6 +1395,10 @@ impl SimState {
                         .give_item(stack_clone.item_id, stack_clone.count as u32);
                     if !changed.is_empty() {
                         let p_eid = p.entity_id;
+                        let pname = p.profile.name.clone();
+                        let awarded = item_by_id(stack_clone.item_id)
+                            .map(|i| p.advancements.check_item_obtained(i.name))
+                            .unwrap_or_default();
                         for (slot_idx, st) in changed {
                             let sid = p.inventory.next_state_id();
                             let _ = p
@@ -747,6 +1411,9 @@ impl SimState {
                             let _ = other.tx.send(take_pkt.clone());
                         }
                         to_remove.push((ih, item_eid));
+                        if !awarded.is_empty() {
+                            self.announce_advancements(&pname, awarded);
+                        }
                     }
                 }
             }
@@ -915,6 +1582,7 @@ impl SimState {
         }
 
         // 6. Tick vanilla FoodData (exhaustion, natural regen, starvation) for survival players
+        let nat_regen = self.world.gamerules.natural_regeneration();
         let player_handles: Vec<PlayerHandle> = self.players.iter().map(|(h, _)| h).collect();
         let mut starve_targets = Vec::new();
         for ph in player_handles {
@@ -932,7 +1600,7 @@ impl SimState {
                     }
                     health_dirty = true;
                 }
-                if p.saturation > 0.0 && p.food >= 20 && p.health < 20.0 {
+                if nat_regen && p.saturation > 0.0 && p.food >= 20 && p.health < 20.0 {
                     p.food_tick_timer += 1;
                     if p.food_tick_timer >= 10 {
                         let spent = p.saturation.min(6.0);
@@ -941,7 +1609,7 @@ impl SimState {
                         p.food_tick_timer = 0;
                         health_dirty = true;
                     }
-                } else if p.food >= 18 && p.health < 20.0 {
+                } else if nat_regen && p.food >= 18 && p.health < 20.0 {
                     p.food_tick_timer += 1;
                     if p.food_tick_timer >= 80 {
                         p.health = (p.health + 1.0).min(20.0);
@@ -1096,12 +1764,40 @@ impl SimState {
             }
         }
 
-        // 8. Weather countdown & Nether/End portal entry teleportation
-        if self.world.raining && self.world.rain_time > 0 {
+        // 8. Weather countdown, random block ticks & Nether/End portal entry teleportation
+        if self.world.gamerules.do_weather_cycle() && self.world.raining && self.world.rain_time > 0 {
             self.world.rain_time -= 1;
             if self.world.rain_time == 0 {
                 self.apply_weather(false, false, 24000);
             }
+        }
+
+        let rts = self.world.gamerules.random_tick_speed().max(0) as u32;
+        if rts > 0 && now % 20 == 0 {
+            let center_chunks: Vec<ChunkPos> = self
+                .players
+                .iter()
+                .filter_map(|(_, p)| {
+                    if p.dimension == DimensionId::Overworld {
+                        Some(p.center_chunk)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut rt_changes = Vec::new();
+            for cp in center_chunks {
+                rt_changes.extend(run_chunk_random_ticks(
+                    &mut self.world,
+                    cp.x,
+                    cp.z,
+                    -64,
+                    320,
+                    rts,
+                    now.wrapping_mul(1_000_003),
+                ));
+            }
+            self.broadcast_block_changes(&rt_changes);
         }
 
         let portal_candidates: Vec<(PlayerHandle, DimensionId, BlockPos)> = self
@@ -1469,6 +2165,10 @@ impl SimState {
         if amount <= 0.0 {
             return;
         }
+        if reason.contains("fell") && !self.world.gamerules.fall_damage() {
+            return;
+        }
+        let keep_inv = self.world.gamerules.keep_inventory();
         let mut hurt_pkt = None;
         let mut death_info: Option<(i32, String, Vec3, Vec<ItemStack>)> = None;
 
@@ -1513,9 +2213,11 @@ impl SimState {
                     let _ = p.tx.send(encode_play_container_close(menu.container_id()));
                 }
                 let mut drops = Vec::new();
-                for s in p.inventory.slots.iter_mut() {
-                    if !s.is_empty() {
-                        drops.push(std::mem::take(s));
+                if !keep_inv {
+                    for s in p.inventory.slots.iter_mut() {
+                        if !s.is_empty() {
+                            drops.push(std::mem::take(s));
+                        }
                     }
                 }
                 death_info = Some((
@@ -1553,7 +2255,11 @@ impl SimState {
     }
 
     fn handle_respawn(&mut self, handle: PlayerHandle) {
-        let spawn_pos = self.world.spawn_pos;
+        let spawn_pos = self
+            .players
+            .get(handle)
+            .and_then(|p| p.spawnpoint)
+            .unwrap_or(self.world.spawn_pos);
         let spawn_vec = Vec3::new(
             spawn_pos.x as f64 + 0.5,
             spawn_pos.y as f64,
@@ -1687,6 +2393,11 @@ impl SimState {
                 p.pitch,
                 0,
             ));
+            let pname = p.profile.name.clone();
+            let awarded = p.advancements.check_dimension_entered(target.name());
+            if !awarded.is_empty() {
+                self.announce_advancements(&pname, awarded);
+            }
         }
     }
 
@@ -1998,6 +2709,28 @@ impl SimState {
     }
 }
 
+fn int_to_bossbar_color(c: i32) -> BossBarColor {
+    match c {
+        0 => BossBarColor::Pink,
+        1 => BossBarColor::Blue,
+        2 => BossBarColor::Red,
+        3 => BossBarColor::Green,
+        4 => BossBarColor::Yellow,
+        5 => BossBarColor::Purple,
+        _ => BossBarColor::White,
+    }
+}
+
+fn int_to_bossbar_overlay(o: i32) -> BossBarOverlay {
+    match o {
+        1 => BossBarOverlay::Notched6,
+        2 => BossBarOverlay::Notched10,
+        3 => BossBarOverlay::Notched12,
+        4 => BossBarOverlay::Notched20,
+        _ => BossBarOverlay::Progress,
+    }
+}
+
 fn abilities_packet_for_gamemode(gamemode: i32) -> Vec<u8> {
     let (invulnerable, flying, may_fly, instabuild) = match gamemode {
         1 => (true, false, true, true),
@@ -2055,6 +2788,7 @@ async fn run_tick_loop(
     let mut sim = SimState {
         world,
         admin,
+        scoreboard: ScoreboardStore::new(),
         players: Arena::new(),
         entities: Arena::new(),
         scheduler: TickScheduler::new(),
@@ -2075,7 +2809,9 @@ async fn run_tick_loop(
             }
             _ = ticker.tick() => {
                 sim.world.game_time += 1;
-                sim.world.day_time += 1;
+                if sim.world.gamerules.do_daylight_cycle() {
+                    sim.world.day_time += 1;
+                }
 
                 let mut should_exit = false;
                 while let Ok(ev) = rx.try_recv() {
@@ -2427,6 +3163,7 @@ fn process_event(
             }
 
             let name = profile.name.clone();
+            let advancements = PlayerAdvancements::load(sim.world.world_dir(), profile.uuid);
             let handle = sim.players.insert(PlayerEntity {
                 entity_id,
                 profile,
@@ -2446,6 +3183,8 @@ fn process_event(
                 xp_total,
                 portal_cooldown: 0,
                 effects: Vec::new(),
+                advancements,
+                spawnpoint: None,
                 fall_distance: 0.0,
                 dead: false,
                 last_death: None,
@@ -2483,6 +3222,8 @@ fn process_event(
                 Vec::new();
             let mut pending_level_events: Vec<(i32, BlockPos, i32)> = Vec::new();
             let mut pending_sign_update: Option<(BlockPos, [String; 4], bool)> = None;
+            let mut pending_explosion: Option<(Vec3, f32, bool)> = None;
+            let mut pending_equip_sync: Option<(i32, EquipmentSlot, ItemStack)> = None;
 
             if let Some(p) = sim.players.get_mut(handle) {
                 match packet {
@@ -2608,6 +3349,11 @@ fn process_event(
                     }
                     PlayServerbound::SetCarriedItem { slot } => {
                         p.inventory.set_selected_hotbar(slot);
+                        pending_equip_sync = Some((
+                            p.entity_id,
+                            EquipmentSlot::MainHand,
+                            p.inventory.held_item().clone(),
+                        ));
                     }
                     PlayServerbound::SetCreativeModeSlot { slot, stack } => {
                         if p.gamemode == 1 && slot >= 0 {
@@ -2785,7 +3531,35 @@ fn process_event(
                             } else {
                                 p.inventory.held_item()
                             };
-                            if let Some(default_place) = item.placed_block_state() {
+                            let held_name = item_by_id(item.item_id).map(|i| i.name).unwrap_or("");
+                            if held_name == "minecraft:flint_and_steel" {
+                                let clicked_state = sim.world.get_block(hit.pos);
+                                if is_tnt(clicked_state.0) {
+                                    let _ = sim.world.set_block_and_relight(hit.pos, BlockStateId::AIR);
+                                    block_changes.push((hit.pos, BlockStateId::AIR));
+                                    pending_explosion = Some((
+                                        Vec3::new(
+                                            hit.pos.x as f64 + 0.5,
+                                            hit.pos.y as f64 + 0.5,
+                                            hit.pos.z as f64 + 0.5,
+                                        ),
+                                        4.0,
+                                        false,
+                                    ));
+                                } else {
+                                    let fire_pos = hit.direction.offset_pos(hit.pos);
+                                    if let Some(portal_blocks) =
+                                        try_ignite_nether_portal(&mut sim.world, fire_pos)
+                                    {
+                                        block_changes.extend(portal_blocks);
+                                    } else if sim.world.get_block(fire_pos).is_air() {
+                                        let fire_st = BlockStateId(FIRE_STATE_ID);
+                                        if sim.world.set_block_and_relight(fire_pos, fire_st).is_some() {
+                                            block_changes.push((fire_pos, fire_st));
+                                        }
+                                    }
+                                }
+                            } else if let Some(default_place) = item.placed_block_state() {
                                 let clicked_state = sim.world.get_block(hit.pos);
                                 let outcome = resolve_placement(
                                     default_place.0,
@@ -3033,6 +3807,20 @@ fn process_event(
                 }
             }
 
+            if let Some((center, power, fire)) = pending_explosion {
+                sim.trigger_explosion(center, power, fire);
+            }
+
+            if let Some((eid, eslot, stack)) = pending_equip_sync {
+                if let Ok(epkt) = encode_play_set_equipment(eid, &[(eslot, stack)]) {
+                    for (other_h, other) in sim.players.iter() {
+                        if other_h != handle {
+                            let _ = other.tx.send(epkt.clone());
+                        }
+                    }
+                }
+            }
+
             for (pos, vel, stack, delay) in drop_spawns {
                 let eid = sim.alloc_entity_id();
                 let ent = WorldEntity::spawn_item(eid, pos, vel, stack, delay);
@@ -3140,17 +3928,31 @@ fn process_event(
                         }
                     });
                     if let Some(vh) = victim_h {
-                        let attacker_name = sim
-                            .players
-                            .get(handle)
-                            .map(|p| p.profile.name.clone())
-                            .unwrap_or_else(|| "a player".into());
-                        sim.damage_player(vh, attack_dmg, &format!("was slain by {attacker_name}"));
+                        if sim.world.gamerules.pvp() {
+                            let attacker_name = sim
+                                .players
+                                .get(handle)
+                                .map(|p| p.profile.name.clone())
+                                .unwrap_or_else(|| "a player".into());
+                            sim.damage_player(
+                                vh,
+                                attack_dmg,
+                                &format!("was slain by {attacker_name}"),
+                            );
+                        }
                     }
                 }
             }
 
             if let Some((cmd_raw, sender_pos)) = pending_command {
+                if let Some(extra_action) = parse_extra_command(&cmd_raw, sender_pos) {
+                    let reply_msg = sim.execute_extra_command(handle, extra_action);
+                    if let Some(p) = sim.players.get(handle) {
+                        if let Ok(pkt) = encode_play_system_chat(&reply_msg, false) {
+                            let _ = p.tx.send(pkt);
+                        }
+                    }
+                } else {
                 let action = commands::parse_command(&cmd_raw, sender_pos);
                 match action {
                     CommandAction::Reply(msg) => {
@@ -3233,6 +4035,7 @@ fn process_event(
                         item_name,
                         count,
                     } => {
+                        let mut adv_out = None;
                         if let Some(p) = sim.players.get_mut(handle) {
                             let changed = p.inventory.give_item(item_id, count);
                             for (slot_idx, st) in changed {
@@ -3241,12 +4044,19 @@ fn process_event(
                                     0, sid, slot_idx, &st,
                                 ));
                             }
+                            let awarded = p.advancements.check_item_obtained(item_name);
+                            if !awarded.is_empty() {
+                                adv_out = Some((p.profile.name.clone(), awarded));
+                            }
                             if let Ok(pkt) = encode_play_system_chat(
                                 &format!("Gave {count} [{item_name}] to {}", p.profile.name),
                                 false,
                             ) {
                                 let _ = p.tx.send(pkt);
                             }
+                        }
+                        if let Some((pname, awarded)) = adv_out {
+                            sim.announce_advancements(&pname, awarded);
                         }
                     }
                     CommandAction::SetTime(ticks) => {
@@ -3539,6 +4349,7 @@ fn process_event(
                         return true;
                     }
                 }
+                }
             }
 
             sim.broadcast_block_changes(&block_changes);
@@ -3572,6 +4383,19 @@ fn process_event(
             }
         }
 
+        TickEvent::ExtraPacket { handle, packet } => {
+            if let PlayExtraServerbound::Swing { hand } = packet {
+                if let Some(eid) = sim.players.get(handle).map(|p| p.entity_id) {
+                    let spkt = encode_play_swing_animation(eid, hand, SwingAnimationType::Whack, 6);
+                    for (other_h, other) in sim.players.iter() {
+                        if other_h != handle {
+                            let _ = other.tx.send(spkt.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         TickEvent::Disconnect { handle } => {
             if let Some(removed) = sim.players.remove(handle) {
                 if let Err(e) = save_player_data(
@@ -3581,6 +4405,7 @@ fn process_event(
                 ) {
                     warn!("Failed saving playerdata for {}: {e}", removed.profile.name);
                 }
+                let _ = removed.advancements.save(sim.world.world_dir());
                 ctx.online_count
                     .store(sim.players.len() as i32, Ordering::Relaxed);
                 let rm_ent = encode_play_remove_entities(&[removed.entity_id]);
@@ -3806,6 +4631,14 @@ async fn handle_connection(
                 match maybe_in {
                     Ok(raw) => {
                         match PlayServerbound::decode(&raw) {
+                            Ok(PlayServerbound::Other(_)) => {
+                                if let Ok(Some(epkt)) = PlayExtraServerbound::decode(&raw) {
+                                    let _ = ctx.tick_tx.send(TickEvent::ExtraPacket {
+                                        handle: player_handle,
+                                        packet: epkt,
+                                    });
+                                }
+                            }
                             Ok(pkt) => {
                                 let _ = ctx.tick_tx.send(TickEvent::Packet {
                                     handle: player_handle,
