@@ -7,13 +7,13 @@ use mc_proto::{
     encode_serverbound_chat_command, encode_serverbound_client_command,
     encode_serverbound_container_click, encode_serverbound_container_close,
     encode_serverbound_player_action, encode_serverbound_set_creative_mode_slot,
-    encode_serverbound_use_item, encode_serverbound_use_item_on,
+    encode_serverbound_sign_update, encode_serverbound_use_item, encode_serverbound_use_item_on,
 };
 use mc_server::{MinecraftServer, ServerConfig};
 use mc_world::{ContainerClickType, ItemStack};
 use std::collections::HashSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -214,6 +214,8 @@ async fn e2e_status_login_config_play_chunks_movement_and_chat() {
     cfg.enable_rcon = true;
     cfg.rcon_port = 0;
     cfg.rcon_password = "silicon263".into();
+    cfg.enable_query = true;
+    cfg.query_port = 0;
     cfg.management_server_enabled = true;
     cfg.management_server_port = 0;
     cfg.management_server_secret = "secret263".into();
@@ -225,6 +227,7 @@ async fn e2e_status_login_config_play_chunks_movement_and_chat() {
     let server = MinecraftServer::bind(cfg).await.unwrap();
     let addr = server.local_addr();
     let rcon_addr = server.rcon_addr().unwrap();
+    let query_addr = server.query_addr().unwrap();
     let jsonrpc_addr = server.jsonrpc_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_task = tokio::spawn(async move {
@@ -1063,6 +1066,145 @@ async fn e2e_status_login_config_play_chunks_movement_and_chat() {
         .expect("Alice's playerdata/<uuid>.dat was not written!");
     assert_eq!(loaded_alice.xp_level, 5);
     assert_eq!(loaded_alice.xp_total, 55);
+
+    // 11. Batch 10 Live E2E: /effect give & clear + Sign editing + Ender Pearl teleport + Live GameSpy4 UDP Query!
+    c1.write_raw_packet(&encode_serverbound_chat_command("effect give regeneration 10 1"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("effect clear"))
+        .await
+        .unwrap();
+    let sign_item = ItemStack::from_name("minecraft:oak_sign", 1).unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &sign_item))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(7, -61, 8),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 1.0,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        109,
+    ))
+    .await
+    .unwrap();
+    c1.write_raw_packet(&encode_serverbound_sign_update(
+        BlockPos::new(7, -60, 8),
+        ["SiliconMC", "26.3", "Rust", "Exact"],
+        true,
+    ))
+    .await
+    .unwrap();
+    let pearl_item = ItemStack::from_name("minecraft:ender_pearl", 1).unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &pearl_item))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item(
+        InteractionHand::MainHand,
+        110,
+        0.0,
+        75.0, // Throw downward so it lands quickly on the flat ground
+    ))
+    .await
+    .unwrap();
+
+    let mut got_update_eff = false;
+    let mut got_remove_eff = false;
+    let mut got_open_sign = false;
+    let mut got_sign_data = false;
+    let mut got_pearl_tp = false;
+    for _ in 0..200 {
+        let raw = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            c1.read_raw_packet(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::UPDATE_MOB_EFFECT {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:update_mob_effect");
+            assert_eq!(reenc, raw);
+            got_update_eff = true;
+        } else if pid == packet_ids::play::clientbound::REMOVE_MOB_EFFECT {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:remove_mob_effect");
+            assert_eq!(reenc, raw);
+            got_remove_eff = true;
+        } else if pid == packet_ids::play::clientbound::OPEN_SIGN_EDITOR {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:open_sign_editor");
+            assert_eq!(reenc, raw);
+            got_open_sign = true;
+        } else if pid == packet_ids::play::clientbound::BLOCK_ENTITY_DATA {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:block_entity_data");
+            // Java CompoundTag uses HashMap (unordered keys), so check exact byte length + decoded content
+            assert_eq!(reenc.len(), raw.len());
+            assert!(String::from_utf8_lossy(&reenc).contains("SiliconMC"));
+            got_sign_data = true;
+        } else if pid == packet_ids::play::clientbound::PLAYER_POSITION {
+            got_pearl_tp = true;
+        }
+        if got_update_eff && got_remove_eff && got_open_sign && got_sign_data && got_pearl_tp {
+            break;
+        }
+    }
+    assert!(got_update_eff, "Expected ClientboundUpdateMobEffectPacket");
+    assert!(got_remove_eff, "Expected ClientboundRemoveMobEffectPacket");
+    assert!(got_open_sign, "Expected ClientboundOpenSignEditorPacket");
+    assert!(got_sign_data, "Expected ClientboundBlockEntityDataPacket for Sign");
+    assert!(got_pearl_tp, "Expected PlayerPosition teleport from landed Ender Pearl");
+
+    // Live GameSpy4 UDP Query test: handshake -> full stat with players!
+    {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sess: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+        let mut hs = vec![0xFE, 0xFD, 0x09];
+        hs.extend_from_slice(&sess);
+        sock.send_to(&hs, query_addr).await.unwrap();
+        let mut rbuf = [0u8; 1024];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sock.recv_from(&mut rbuf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rbuf[0], 9);
+        assert_eq!(&rbuf[1..5], &sess);
+        let tok_str = std::str::from_utf8(&rbuf[5..n - 1]).unwrap();
+        let token: i32 = tok_str.parse().unwrap();
+
+        let mut req = vec![0xFE, 0xFD, 0x00];
+        req.extend_from_slice(&sess);
+        req.extend_from_slice(&token.to_be_bytes());
+        req.extend_from_slice(&[0, 0, 0, 0]); // Full stat padding -> 15 bytes total
+        sock.send_to(&req, query_addr).await.unwrap();
+        let (sn, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sock.recv_from(&mut rbuf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rbuf[0], 0);
+        let stat_text = String::from_utf8_lossy(&rbuf[5..sn]);
+        assert!(stat_text.contains("SiliconMC-Rust"), "Missing SiliconMC-Rust in UDP Query: {stat_text}");
+        assert!(stat_text.contains("26.3"), "Missing 26.3 version in UDP Query: {stat_text}");
+        assert!(stat_text.contains("Alice"), "Missing Alice player in UDP Query: {stat_text}");
+    }
 
     let _ = shutdown_tx.send(());
     let _ = server_task.await;

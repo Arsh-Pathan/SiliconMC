@@ -2,7 +2,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use mc_data::block_behaviors::{
-    KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_FURNACE, KIND_HOPPER, KIND_SMOKER,
+    KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_FURNACE, KIND_HOPPER, KIND_SIGN, KIND_SMOKER,
     block_behavior,
 };
 use mc_data::recipes::{COOK_BLASTING, COOK_SMELTING, COOK_SMOKING};
@@ -387,6 +387,7 @@ impl WorldStore {
             KIND_BLAST_FURNACE => Some(BlockEntity::new_furnace(pos, COOK_BLASTING)),
             KIND_SMOKER => Some(BlockEntity::new_furnace(pos, COOK_SMOKING)),
             KIND_HOPPER => Some(BlockEntity::new_hopper(pos)),
+            KIND_SIGN => Some(BlockEntity::new_sign(pos)),
             _ => None,
         }
     }

@@ -33,7 +33,7 @@ pub fn build_commands_packet() -> Vec<u8> {
     //     23: arg "pos" (minecraft:vec3 = 10), executable
     // 24: literal "kill", executable
     let nodes = vec![
-        CommandNodeEntry::root(vec![1, 3, 5, 8, 11, 15, 16, 17, 18, 19, 20, 21, 24, 25, 27, 29, 31, 33, 35, 37, 40, 42]),
+        CommandNodeEntry::root(vec![1, 3, 5, 8, 11, 15, 16, 17, 18, 19, 20, 21, 24, 25, 27, 29, 31, 33, 35, 37, 40, 42, 44]),
         CommandNodeEntry::literal("gamemode", false, vec![2]),
         CommandNodeEntry::argument("gamemode", CommandArgType::GameMode, true, vec![]),
         CommandNodeEntry::literal("tp", false, vec![4]),
@@ -84,6 +84,8 @@ pub fn build_commands_packet() -> Vec<u8> {
         CommandNodeEntry::literal("weather", false, vec![41]),
         CommandNodeEntry::argument("mode", CommandArgType::GreedyPhrase, true, vec![]),
         CommandNodeEntry::literal("xp", false, vec![43]),
+        CommandNodeEntry::argument("args", CommandArgType::GreedyPhrase, true, vec![]),
+        CommandNodeEntry::literal("effect", false, vec![45]),
         CommandNodeEntry::argument("args", CommandArgType::GreedyPhrase, true, vec![]),
     ];
     encode_play_commands(&nodes, 0)
@@ -145,6 +147,12 @@ pub enum CommandAction {
         amount: i32,
         is_levels: bool,
     },
+    EffectGive {
+        effect: String,
+        seconds: i32,
+        amplifier: i32,
+    },
+    EffectClear,
     StopServer,
 }
 
@@ -259,6 +267,53 @@ pub fn parse_command(raw: &str, sender_pos: Vec3) -> CommandAction {
                 set_mode,
                 amount,
                 is_levels,
+            }
+        }
+        "effect" => {
+            if parts.len() < 2 {
+                return CommandAction::Reply(
+                    "Usage: /effect <give <effect> [seconds] [amplifier] | clear>".into(),
+                );
+            }
+            match parts[1].to_ascii_lowercase().as_str() {
+                "clear" => CommandAction::EffectClear,
+                "give" => {
+                    if parts.len() < 3 {
+                        return CommandAction::Reply(
+                            "Usage: /effect give <effect> [seconds] [amplifier]".into(),
+                        );
+                    }
+                    // Support optional player selector before effect name
+                    let (eff_idx, sec_idx, amp_idx) = if parts.len() >= 4
+                        && (parts[2].starts_with('@')
+                            || mc_data::static_registry_protocol_id(
+                                "minecraft:mob_effect",
+                                &normalize_mc_id(parts[2]),
+                            )
+                            .is_none())
+                    {
+                        (3, 4, 5)
+                    } else {
+                        (2, 3, 4)
+                    };
+                    let effect = normalize_mc_id(parts[eff_idx]);
+                    let seconds = parts
+                        .get(sec_idx)
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(30)
+                        .clamp(1, 1_000_000);
+                    let amplifier = parts
+                        .get(amp_idx)
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(0)
+                        .clamp(0, 255);
+                    CommandAction::EffectGive {
+                        effect,
+                        seconds,
+                        amplifier,
+                    }
+                }
+                other => CommandAction::Reply(format!("Unknown /effect action: {other}")),
             }
         }
         "list" => CommandAction::ListPlayers,

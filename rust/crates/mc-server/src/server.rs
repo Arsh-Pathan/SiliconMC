@@ -4,17 +4,21 @@ use crate::commands::{self, CommandAction};
 use crate::config::ServerConfig;
 use crate::jsonrpc::JsonRpcServer;
 use crate::playerdata::{SavedPlayerData, add_experience_points, load_player_data, save_player_data};
+use crate::query::{QueryServer, QuerySnapshot};
 use crate::rcon::RconServer;
 use crate::world_loader::{DimensionId, WorldStore};
 use anyhow::Result;
 use mc_data::block_behaviors::{
     KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_CRAFTING_TABLE, KIND_END_PORTAL,
-    KIND_FURNACE, KIND_HOPPER, KIND_NETHER_PORTAL, KIND_SMOKER, block_behavior, resolve_placement,
+    KIND_FURNACE, KIND_HOPPER, KIND_NETHER_PORTAL, KIND_SIGN, KIND_SMOKER, block_behavior,
+    resolve_placement,
 };
+use mc_data::items::item_by_id;
 use mc_data::loot_and_tools::{block_loot, entity_loot, item_combat_stats};
-use mc_data::recipes::{food_info, menu_types};
+use mc_data::recipes::{block_entity_types, food_info, menu_types};
 use mc_data::{
     BlockStateId, ENTITY_TYPE_PLAYER_ID, LoadedDatapacks, PROTOCOL_VERSION, VERSION_NAME,
+    static_registry_protocol_id,
 };
 use mc_math::{BlockPos, ChunkPos, Vec3};
 use mc_proto::{
@@ -24,18 +28,20 @@ use mc_proto::{
     StatusServerbound, encode_config_custom_payload_brand, encode_config_finish,
     encode_config_registry_data, encode_config_select_known_packs, encode_config_update_tags_raw,
     encode_login_compression, encode_login_disconnect, encode_login_finished, encode_login_hello,
-    encode_play_add_entity, encode_play_block_changed_ack, encode_play_block_update,
-    encode_play_chunk_batch_finished, encode_play_chunk_batch_start, encode_play_container_close,
-    encode_play_container_set_content, encode_play_container_set_data,
-    encode_play_container_set_slot, encode_play_disconnect, encode_play_entity_event,
-    encode_play_entity_position_sync, encode_play_game_event, encode_play_hurt_animation,
-    encode_play_keep_alive, encode_play_level_chunk_with_light, encode_play_light_update,
-    encode_play_open_screen, encode_play_player_abilities, encode_play_player_info_add,
+    encode_play_add_entity, encode_play_block_changed_ack, encode_play_block_entity_data,
+    encode_play_block_update, encode_play_chunk_batch_finished, encode_play_chunk_batch_start,
+    encode_play_container_close, encode_play_container_set_content,
+    encode_play_container_set_data, encode_play_container_set_slot, encode_play_disconnect,
+    encode_play_entity_event, encode_play_entity_position_sync, encode_play_game_event,
+    encode_play_hurt_animation, encode_play_keep_alive, encode_play_level_chunk_with_light,
+    encode_play_level_event, encode_play_light_update, encode_play_open_screen,
+    encode_play_open_sign_editor, encode_play_player_abilities, encode_play_player_info_add,
     encode_play_player_info_remove, encode_play_player_position, encode_play_remove_entities,
-    encode_play_set_chunk_cache_center, encode_play_set_default_spawn, encode_play_set_entity_data,
-    encode_play_set_entity_motion, encode_play_set_experience, encode_play_set_health,
-    encode_play_set_held_slot, encode_play_set_time, encode_play_system_chat,
-    encode_play_take_item_entity, encode_status_pong, encode_status_response, offline_player_uuid,
+    encode_play_remove_mob_effect, encode_play_set_chunk_cache_center,
+    encode_play_set_default_spawn, encode_play_set_entity_data, encode_play_set_entity_motion,
+    encode_play_set_experience, encode_play_set_health, encode_play_set_held_slot,
+    encode_play_set_time, encode_play_system_chat, encode_play_take_item_entity,
+    encode_play_update_mob_effect, encode_status_pong, encode_status_response, offline_player_uuid,
 };
 use mc_world::{
     Arena, BlockEntityKind, ContainerClickType, DirtyLightSections, EntityKind, EntityTickOutcome,
@@ -85,6 +91,14 @@ impl OpenMenu {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ActiveEffect {
+    effect_id: i32,
+    name: String,
+    amplifier: i32,
+    duration: i32,
+}
+
 struct PlayerEntity {
     entity_id: i32,
     profile: GameProfile,
@@ -103,6 +117,7 @@ struct PlayerEntity {
     xp_progress: f32,
     xp_total: i32,
     portal_cooldown: u32,
+    effects: Vec<ActiveEffect>,
     fall_distance: f64,
     dead: bool,
     last_death: Option<(String, BlockPos)>,
@@ -166,6 +181,9 @@ enum TickEvent {
         params: serde_json::Value,
         reply: oneshot::Sender<Result<serde_json::Value, (i32, String)>>,
     },
+    QueryStatus {
+        reply: oneshot::Sender<QuerySnapshot>,
+    },
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -207,6 +225,8 @@ pub struct MinecraftServer {
     local_addr: SocketAddr,
     rcon_server: Option<RconServer>,
     rcon_addr: Option<SocketAddr>,
+    query_server: Option<QueryServer>,
+    query_addr: Option<SocketAddr>,
     jsonrpc_server: Option<JsonRpcServer>,
     jsonrpc_addr: Option<SocketAddr>,
     ctx: Arc<SharedContext>,
@@ -287,6 +307,18 @@ impl MinecraftServer {
             (None, None)
         };
 
+        let (query_server, query_addr) = if config.enable_query {
+            let tx_clone = tick_tx.clone();
+            let cb = Arc::new(move |reply: oneshot::Sender<QuerySnapshot>| {
+                let _ = tx_clone.send(TickEvent::QueryStatus { reply });
+            });
+            let srv = QueryServer::bind(&config.bind_addr, config.query_port, cb).await?;
+            let qaddr = srv.local_addr();
+            (Some(srv), Some(qaddr))
+        } else {
+            (None, None)
+        };
+
         let ctx = Arc::new(SharedContext {
             config,
             keypair,
@@ -302,6 +334,8 @@ impl MinecraftServer {
             local_addr,
             rcon_server,
             rcon_addr,
+            query_server,
+            query_addr,
             jsonrpc_server,
             jsonrpc_addr,
             ctx,
@@ -316,6 +350,10 @@ impl MinecraftServer {
 
     pub fn rcon_addr(&self) -> Option<SocketAddr> {
         self.rcon_addr
+    }
+
+    pub fn query_addr(&self) -> Option<SocketAddr> {
+        self.query_addr
     }
 
     pub fn jsonrpc_addr(&self) -> Option<SocketAddr> {
@@ -340,6 +378,10 @@ impl MinecraftServer {
         });
         let rcon_handle = self
             .rcon_server
+            .take()
+            .map(|srv| tokio::spawn(async move { srv.run().await }));
+        let query_handle = self
+            .query_server
             .take()
             .map(|srv| tokio::spawn(async move { srv.run().await }));
         let jsonrpc_handle = self
@@ -392,6 +434,9 @@ impl MinecraftServer {
             let _ = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
         }
         if let Some(h) = rcon_handle {
+            h.abort();
+        }
+        if let Some(h) = query_handle {
             h.abort();
         }
         if let Some(h) = jsonrpc_handle {
@@ -468,7 +513,7 @@ impl SimState {
                 ent.entity_id,
                 &[EntityDataValue::Float(9, *health)],
             )),
-            EntityKind::FallingBlock { .. } => None,
+            EntityKind::FallingBlock { .. } | EntityKind::Projectile { .. } => None,
         };
         for (_, p) in self.players.iter() {
             let _ = p.tx.send(add_pkt.clone());
@@ -514,6 +559,67 @@ impl SimState {
         }
     }
 
+    fn give_player_effect(
+        &mut self,
+        handle: PlayerHandle,
+        effect_name: &str,
+        duration_ticks: i32,
+        amplifier: i32,
+    ) -> Result<(), String> {
+        let Some(effect_id) = static_registry_protocol_id("minecraft:mob_effect", effect_name)
+        else {
+            return Err(format!("Unknown mob effect: {effect_name}"));
+        };
+        if effect_name == "minecraft:instant_health" {
+            if let Some(p) = self.players.get_mut(handle) {
+                let heal = (4 << amplifier.clamp(0, 5)) as f32;
+                p.health = (p.health + heal).min(20.0);
+                let _ = p.tx.send(encode_play_set_health(p.health, p.food, p.saturation));
+            }
+            return Ok(());
+        }
+        if effect_name == "minecraft:instant_damage" {
+            let dmg = (6 << amplifier.clamp(0, 5)) as f32;
+            self.damage_player(handle, dmg, "was killed by magic");
+            return Ok(());
+        }
+        if let Some(p) = self.players.get_mut(handle) {
+            if let Some(existing) = p.effects.iter_mut().find(|e| e.effect_id == effect_id) {
+                existing.amplifier = existing.amplifier.max(amplifier);
+                existing.duration = existing.duration.max(duration_ticks);
+            } else {
+                p.effects.push(ActiveEffect {
+                    effect_id,
+                    name: effect_name.to_string(),
+                    amplifier,
+                    duration: duration_ticks,
+                });
+            }
+            let _ = p.tx.send(encode_play_update_mob_effect(
+                p.entity_id,
+                effect_id,
+                amplifier,
+                duration_ticks,
+                0x06, // visible | show_icon
+            ));
+        }
+        Ok(())
+    }
+
+    fn clear_player_effects(&mut self, handle: PlayerHandle) -> usize {
+        let Some(p) = self.players.get_mut(handle) else {
+            return 0;
+        };
+        let removed: Vec<ActiveEffect> = std::mem::take(&mut p.effects);
+        let n = removed.len();
+        for ef in removed {
+            let _ = p
+                .tx
+                .send(encode_play_remove_mob_effect(p.entity_id, ef.effect_id));
+        }
+        n
+    }
+
     fn tick_scheduled_and_entities(&mut self) {
         let now = self.world.game_time as u64;
 
@@ -540,6 +646,7 @@ impl SimState {
         let handles: Vec<Handle<WorldEntity>> = self.entities.iter().map(|(h, _)| h).collect();
         let mut to_remove: Vec<(Handle<WorldEntity>, i32)> = Vec::new();
         let mut landed_blocks: Vec<(BlockPos, BlockStateId)> = Vec::new();
+        let mut projectile_hits: Vec<(Vec3, String, i32, f32)> = Vec::new();
         let mut moved_pkts: Vec<Vec<u8>> = Vec::new();
 
         for h in handles {
@@ -553,6 +660,15 @@ impl SimState {
                 EntityTickOutcome::LandedFallingBlock { pos, state } => {
                     to_remove.push((h, ent.entity_id));
                     landed_blocks.push((pos, state));
+                }
+                EntityTickOutcome::ProjectileHit {
+                    hit_pos,
+                    kind_name,
+                    owner_eid,
+                    damage,
+                } => {
+                    to_remove.push((h, ent.entity_id));
+                    projectile_hits.push((hit_pos, kind_name, owner_eid, damage));
                 }
                 EntityTickOutcome::Alive { moved } => {
                     if moved {
@@ -671,6 +787,86 @@ impl SimState {
             self.broadcast_block_changes(&placed_changes);
         }
 
+        // Resolve projectile impacts (Ender Pearl teleport + Arrow/Snowball mob hits)
+        for (hit_pos, kind_name, owner_eid, damage) in projectile_hits {
+            if kind_name == "minecraft:ender_pearl" {
+                let owner_h = self
+                    .players
+                    .iter()
+                    .find_map(|(ph, p)| if p.entity_id == owner_eid { Some(ph) } else { None });
+                if let Some(oh) = owner_h {
+                    let tp_pos = Vec3::new(hit_pos.x, hit_pos.y + 0.1, hit_pos.z);
+                    let mut sync_pkt = None;
+                    if let Some(p) = self.players.get_mut(oh) {
+                        p.pos = tp_pos;
+                        p.fall_distance = 0.0;
+                        let tp_id = p.next_teleport_id;
+                        p.next_teleport_id += 1;
+                        let _ = p.tx.send(encode_play_player_position(
+                            tp_id,
+                            tp_pos,
+                            Vec3::ZERO,
+                            p.yaw,
+                            p.pitch,
+                            0,
+                        ));
+                        let bp = BlockPos::new(
+                            tp_pos.x.floor() as i32,
+                            tp_pos.y.floor() as i32,
+                            tp_pos.z.floor() as i32,
+                        );
+                        let _ = p.tx.send(encode_play_level_event(2003, bp, 0, false));
+                        stream_chunks_for_player(p, &mut self.world);
+                        sync_pkt = Some(encode_play_entity_position_sync(
+                            p.entity_id,
+                            p.pos,
+                            p.yaw,
+                            p.pitch,
+                            true,
+                        ));
+                    }
+                    if let Some(sp) = sync_pkt {
+                        for (ph, other) in self.players.iter() {
+                            if ph != oh {
+                                let _ = other.tx.send(sp.clone());
+                            }
+                        }
+                    }
+                    self.damage_player(oh, 5.0, "hit the ground too hard");
+                }
+            } else if damage > 0.0 {
+                // Check mobs within 2.5 blocks of arrow impact
+                let hit_mob = self.entities.iter().find_map(|(eh, e)| {
+                    if matches!(e.kind, EntityKind::Mob { .. }) {
+                        let d2 = (e.pos.x - hit_pos.x).powi(2)
+                            + (e.pos.y + 0.9 - hit_pos.y).powi(2)
+                            + (e.pos.z - hit_pos.z).powi(2);
+                        if d2 <= 6.25 { Some(eh) } else { None }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(mh) = hit_mob {
+                    let mut died_eid = None;
+                    if let Some(ent) = self.entities.get_mut(mh) {
+                        if let EntityKind::Mob { ref mut health, .. } = ent.kind {
+                            *health = (*health - damage).max(0.0);
+                            if *health <= 0.0 {
+                                died_eid = Some(ent.entity_id);
+                            }
+                        }
+                    }
+                    if let Some(eid) = died_eid {
+                        self.entities.remove(mh);
+                        let rm = encode_play_remove_entities(&[eid]);
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(rm.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Tick all loaded furnace block entities (smelting, fuel, lit state, viewer sync)
         let furnace_updates = self.world.tick_furnaces();
         let mut lit_changes = Vec::new();
@@ -773,6 +969,68 @@ impl SimState {
         }
         for ph in starve_targets {
             self.damage_player(ph, 1.0, "starved to death");
+        }
+
+        // 6b. Tick active player MobEffects (Regeneration, Poison, Wither, Hunger, Saturation, Expiration)
+        let eff_handles: Vec<PlayerHandle> = self.players.iter().map(|(h, _)| h).collect();
+        let mut effect_damages: Vec<(PlayerHandle, f32, &'static str)> = Vec::new();
+        for ph in eff_handles {
+            if let Some(p) = self.players.get_mut(ph) {
+                if p.dead || p.effects.is_empty() {
+                    continue;
+                }
+                let mut health_dirty = false;
+                let mut expired = Vec::new();
+                for ef in p.effects.iter_mut() {
+                    let amp = ef.amplifier.clamp(0, 5);
+                    match ef.name.as_str() {
+                        "minecraft:regeneration" => {
+                            let interval = (50 >> amp).max(1);
+                            if ef.duration % interval == 0 && p.health < 20.0 {
+                                p.health = (p.health + 1.0).min(20.0);
+                                health_dirty = true;
+                            }
+                        }
+                        "minecraft:poison" => {
+                            let interval = (25 >> amp).max(1);
+                            if ef.duration % interval == 0 && p.health > 1.0 {
+                                effect_damages.push((ph, 1.0, "died of poison"));
+                            }
+                        }
+                        "minecraft:wither" => {
+                            let interval = (40 >> amp).max(1);
+                            if ef.duration % interval == 0 {
+                                effect_damages.push((ph, 1.0, "withered away"));
+                            }
+                        }
+                        "minecraft:hunger" => {
+                            p.food_exhaustion += 0.005 * (amp + 1) as f32;
+                        }
+                        "minecraft:saturation" => {
+                            p.food = (p.food + amp + 1).min(20);
+                            p.saturation = (p.saturation + 2.0 * (amp + 1) as f32).min(p.food as f32);
+                            health_dirty = true;
+                        }
+                        _ => {}
+                    }
+                    ef.duration -= 1;
+                    if ef.duration <= 0 {
+                        expired.push(ef.effect_id);
+                    }
+                }
+                if !expired.is_empty() {
+                    p.effects.retain(|e| e.duration > 0);
+                    for eid in expired {
+                        let _ = p.tx.send(encode_play_remove_mob_effect(p.entity_id, eid));
+                    }
+                }
+                if health_dirty {
+                    let _ = p.tx.send(encode_play_set_health(p.health, p.food, p.saturation));
+                }
+            }
+        }
+        for (ph, dmg, reason) in effect_damages {
+            self.damage_player(ph, dmg, reason);
         }
 
         // 7. Hostile mob chasing & melee combat (every 10 ticks)
@@ -1896,6 +2154,29 @@ fn process_event(
             }
         }
 
+        TickEvent::QueryStatus { reply } => {
+            let players: Vec<String> = sim
+                .players
+                .iter()
+                .map(|(_, p)| p.profile.name.clone())
+                .collect();
+            let world_name = sim
+                .world
+                .world_dir()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("world")
+                .to_string();
+            let _ = reply.send(QuerySnapshot {
+                motd: ctx.config.motd.clone(),
+                world_name,
+                max_players: ctx.config.max_players,
+                server_port: ctx.config.port,
+                host_ip: ctx.config.bind_addr.clone(),
+                players,
+            });
+        }
+
         TickEvent::Shutdown { done } => {
             sim.save_all_players();
             if let Err(e) = sim.world.save_dirty_chunks() {
@@ -2164,6 +2445,7 @@ fn process_event(
                 xp_progress,
                 xp_total,
                 portal_cooldown: 0,
+                effects: Vec::new(),
                 fall_distance: 0.0,
                 dead: false,
                 last_death: None,
@@ -2196,6 +2478,11 @@ fn process_event(
             let mut pending_container_click: Option<(i32, i16, i8, ContainerClickType)> = None;
             let mut pending_container_close: Option<i32> = None;
             let mut pending_respawn = false;
+            let mut pending_effects: Vec<(&'static str, i32, i32)> = Vec::new();
+            let mut pending_projectiles: Vec<(&'static str, i32, Vec3, f32, f32, f64, f32)> =
+                Vec::new();
+            let mut pending_level_events: Vec<(i32, BlockPos, i32)> = Vec::new();
+            let mut pending_sign_update: Option<(BlockPos, [String; 4], bool)> = None;
 
             if let Some(p) = sim.players.get_mut(handle) {
                 match packet {
@@ -2312,6 +2599,13 @@ fn process_event(
                     } => {
                         pending_respawn = true;
                     }
+                    PlayServerbound::SignUpdate {
+                        pos,
+                        lines,
+                        is_front,
+                    } => {
+                        pending_sign_update = Some((pos, lines, is_front));
+                    }
                     PlayServerbound::SetCarriedItem { slot } => {
                         p.inventory.set_selected_hotbar(slot);
                     }
@@ -2340,6 +2634,7 @@ fn process_event(
                                     sim.world.set_block_and_relight(pos, BlockStateId::AIR)
                                 {
                                     if old != BlockStateId::AIR {
+                                        pending_level_events.push((2001, pos, old.0 as i32));
                                         block_changes.push((pos, BlockStateId::AIR));
                                         block_changes.extend(propagate_neighbor_updates(
                                             &mut sim.world,
@@ -2357,6 +2652,7 @@ fn process_event(
                                     if let Some((old, _)) =
                                         sim.world.set_block_and_relight(pos, BlockStateId::AIR)
                                     {
+                                        pending_level_events.push((2001, pos, old.0 as i32));
                                         block_changes.push((pos, BlockStateId::AIR));
                                         block_changes.extend(propagate_neighbor_updates(
                                             &mut sim.world,
@@ -2476,6 +2772,8 @@ fn process_event(
                         );
                         if opens_screen {
                             pending_open_menu = Some(hit.pos);
+                        } else if clicked_kind == KIND_SIGN {
+                            let _ = p.tx.send(encode_play_open_sign_editor(hit.pos, true));
                         } else if let Some(interacted) =
                             interact_block(&mut sim.world, &mut sim.scheduler, now, hit.pos)
                         {
@@ -2519,6 +2817,11 @@ fn process_event(
                                     {
                                         let mut seeds = vec![target_pos];
                                         block_changes.push((target_pos, place_state));
+                                        if block_behavior(place_state.0).kind == KIND_SIGN {
+                                            let _ = p
+                                                .tx
+                                                .send(encode_play_open_sign_editor(target_pos, true));
+                                        }
                                         if let Some((dx, dy, dz, sec_id)) = outcome.secondary {
                                             let sec_pos = target_pos.offset(dx, dy, dz);
                                             let sec_st = BlockStateId(sec_id);
@@ -2555,7 +2858,12 @@ fn process_event(
                             let _ = p.tx.send(encode_play_block_changed_ack(sequence));
                         }
                     }
-                    PlayServerbound::UseItem { hand, sequence, .. } => {
+                    PlayServerbound::UseItem {
+                        hand,
+                        sequence,
+                        yaw,
+                        pitch,
+                    } => {
                         let offhand = hand == InteractionHand::OffHand;
                         let slot_idx = if offhand {
                             PlayerInventory::OFFHAND_SLOT
@@ -2564,8 +2872,35 @@ fn process_event(
                         };
                         let held = p.inventory.slots[slot_idx].clone();
                         if !held.is_empty() {
+                            let item_name = item_by_id(held.item_id).map(|i| i.name).unwrap_or("");
                             let cs = item_combat_stats(held.item_id);
-                            if (5..=8).contains(&cs.armor_slot) {
+                            let throw_spec = match item_name {
+                                "minecraft:snowball" => Some(("minecraft:snowball", 1.5, 0.0, true)),
+                                "minecraft:egg" => Some(("minecraft:egg", 1.5, 0.0, true)),
+                                "minecraft:ender_pearl" => Some(("minecraft:ender_pearl", 1.5, 0.0, true)),
+                                "minecraft:bow" => Some(("minecraft:arrow", 2.2, 6.0, false)),
+                                _ => None,
+                            };
+                            if let Some((proj_kind, speed, dmg, consume_self)) = throw_spec {
+                                let eye = Vec3::new(p.pos.x, p.pos.y + 1.52, p.pos.z);
+                                pending_projectiles.push((
+                                    proj_kind,
+                                    p.entity_id,
+                                    eye,
+                                    yaw,
+                                    pitch,
+                                    speed,
+                                    dmg,
+                                ));
+                                if consume_self && p.gamemode == 0 {
+                                    if let Some((si, updated)) = p.inventory.consume_one(offhand) {
+                                        let sid = p.inventory.next_state_id();
+                                        let _ = p.tx.send(encode_play_container_set_slot(
+                                            0, sid, si, &updated,
+                                        ));
+                                    }
+                                }
+                            } else if (5..=8).contains(&cs.armor_slot) {
                                 // Quick-equip armor into vanilla armor slot 5..=8!
                                 let aslot = cs.armor_slot as usize;
                                 p.inventory.slots.swap(slot_idx, aslot);
@@ -2584,7 +2919,11 @@ fn process_event(
                                     &p.inventory.slots[aslot],
                                 ));
                             } else if let Some(fi) = food_info(held.item_id) {
-                                if p.food < 20 || p.gamemode == 1 {
+                                let always_edible = matches!(
+                                    item_name,
+                                    "minecraft:golden_apple" | "minecraft:enchanted_golden_apple"
+                                );
+                                if p.food < 20 || p.gamemode == 1 || always_edible {
                                     p.food = (p.food + fi.nutrition as i32).min(20);
                                     p.saturation =
                                         (p.saturation + fi.saturation).min(p.food as f32);
@@ -2593,6 +2932,15 @@ fn process_event(
                                         p.food,
                                         p.saturation,
                                     ));
+                                    if item_name == "minecraft:golden_apple" {
+                                        pending_effects.push(("minecraft:regeneration", 100, 1));
+                                        pending_effects.push(("minecraft:absorption", 2400, 0));
+                                    } else if item_name == "minecraft:enchanted_golden_apple" {
+                                        pending_effects.push(("minecraft:regeneration", 400, 1));
+                                        pending_effects.push(("minecraft:resistance", 6000, 0));
+                                        pending_effects.push(("minecraft:fire_resistance", 6000, 0));
+                                        pending_effects.push(("minecraft:absorption", 2400, 3));
+                                    }
                                     if p.gamemode == 0 {
                                         if let Some((si, updated)) =
                                             p.inventory.consume_one(offhand)
@@ -2634,6 +2982,55 @@ fn process_event(
 
             if pending_respawn {
                 sim.handle_respawn(handle);
+            }
+
+            if let Some((spos, lines, is_front)) = pending_sign_update {
+                if let Some(be) = sim.world.ensure_block_entity(spos) {
+                    if let BlockEntityKind::Sign {
+                        ref mut front_lines,
+                        ref mut back_lines,
+                        is_waxed,
+                    } = be.kind
+                    {
+                        if !is_waxed {
+                            if is_front {
+                                *front_lines = lines;
+                            } else {
+                                *back_lines = lines;
+                            }
+                            let nbt = be.save_to_nbt();
+                            if let Ok(pkt) = encode_play_block_entity_data(
+                                spos,
+                                block_entity_types::SIGN,
+                                &nbt,
+                            ) {
+                                for (_, other) in sim.players.iter() {
+                                    let _ = other.tx.send(pkt.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (eff_name, dur, amp) in pending_effects {
+                let _ = sim.give_player_effect(handle, eff_name, dur, amp);
+            }
+
+            for (pkind, owner_eid, origin, pyaw, ppitch, speed, dmg) in pending_projectiles {
+                let eid = sim.alloc_entity_id();
+                if let Some(ent) = WorldEntity::spawn_projectile(
+                    eid, pkind, owner_eid, origin, pyaw, ppitch, speed, dmg,
+                ) {
+                    sim.spawn_world_entity(ent);
+                }
+            }
+
+            for (ev_type, ev_pos, ev_data) in pending_level_events {
+                let lpkt = encode_play_level_event(ev_type, ev_pos, ev_data, false);
+                for (_, other) in sim.players.iter() {
+                    let _ = other.tx.send(lpkt.clone());
+                }
             }
 
             for (pos, vel, stack, delay) in drop_spawns {
@@ -2958,6 +3355,32 @@ fn process_event(
                                     "Experience updated: level {} ({} total XP)",
                                     p.xp_level, p.xp_total
                                 ),
+                                false,
+                            ) {
+                                let _ = p.tx.send(pkt);
+                            }
+                        }
+                    }
+                    CommandAction::EffectGive {
+                        effect,
+                        seconds,
+                        amplifier,
+                    } => {
+                        let msg = match sim.give_player_effect(handle, &effect, seconds * 20, amplifier) {
+                            Ok(()) => format!("Applied effect {effect} ({seconds}s, amp {amplifier})"),
+                            Err(e) => e,
+                        };
+                        if let Some(p) = sim.players.get(handle) {
+                            if let Ok(pkt) = encode_play_system_chat(&msg, false) {
+                                let _ = p.tx.send(pkt);
+                            }
+                        }
+                    }
+                    CommandAction::EffectClear => {
+                        let n = sim.clear_player_effects(handle);
+                        if let Some(p) = sim.players.get(handle) {
+                            if let Ok(pkt) = encode_play_system_chat(
+                                &format!("Removed {n} active effect(s)"),
                                 false,
                             ) {
                                 let _ = p.tx.send(pkt);
