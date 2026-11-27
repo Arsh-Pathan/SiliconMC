@@ -1078,6 +1078,15 @@ pub fn encode_play_set_health(health: f32, food: i32, saturation: f32) -> Vec<u8
     w.into_bytes()
 }
 
+pub fn encode_play_set_experience(progress: f32, level: i32, total_xp: i32) -> Vec<u8> {
+    let mut w = PacketWriter::new();
+    w.write_varint(packet_ids::play::clientbound::SET_EXPERIENCE);
+    w.write_f32(progress);
+    w.write_varint(level);
+    w.write_varint(total_xp);
+    w.into_bytes()
+}
+
 pub fn encode_play_hurt_animation(entity_id: i32, yaw: f32) -> Vec<u8> {
     let mut w = PacketWriter::new();
     w.write_varint(packet_ids::play::clientbound::HURT_ANIMATION);
@@ -2178,6 +2187,12 @@ mod tests {
             "clientbound",
             "minecraft:set_health",
             &encode_play_set_health(14.5, 18, 3.25),
+        );
+        assert_oracle_roundtrip(
+            "play",
+            "clientbound",
+            "minecraft:set_experience",
+            &encode_play_set_experience(0.45, 12, 230),
         );
         assert_oracle_roundtrip(
             "play",
