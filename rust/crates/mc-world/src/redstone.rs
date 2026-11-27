@@ -1,10 +1,11 @@
 use crate::{ScheduledTick, ScheduledTickKind, TickScheduler, fluid_tick_delay, tick_fluid};
 use mc_data::BlockStateId;
 use mc_data::block_behaviors::{
-    KIND_BUTTON, KIND_DOOR, KIND_FALLING_BLOCK, KIND_FENCE_GATE, KIND_LAVA, KIND_LEVER,
-    KIND_PISTON, KIND_PISTON_HEAD, KIND_PRESSURE_PLATE, KIND_REDSTONE_BLOCK, KIND_REDSTONE_LAMP,
-    KIND_REDSTONE_TORCH, KIND_REDSTONE_WIRE, KIND_REPEATER, KIND_STICKY_PISTON, KIND_TRAPDOOR,
-    KIND_WATER, PISTON_HEAD_STATES, block_behavior, redstone_wire_with_power,
+    KIND_BUTTON, KIND_COMPARATOR, KIND_DOOR, KIND_FALLING_BLOCK, KIND_FENCE_GATE, KIND_LAVA,
+    KIND_LEVER, KIND_OBSERVER, KIND_PISTON, KIND_PISTON_HEAD, KIND_PRESSURE_PLATE,
+    KIND_REDSTONE_BLOCK, KIND_REDSTONE_LAMP, KIND_REDSTONE_TORCH, KIND_REDSTONE_WIRE,
+    KIND_REPEATER, KIND_STICKY_PISTON, KIND_TRAPDOOR, KIND_WATER, PISTON_HEAD_STATES,
+    block_behavior, cycle_repeater_delay, redstone_wire_with_power, toggle_comparator_mode,
 };
 use mc_math::BlockPos;
 use std::collections::{HashSet, VecDeque};
@@ -45,10 +46,72 @@ fn dir_offset(d: u8) -> (i32, i32, i32) {
     }
 }
 
+#[inline]
+fn horizontal_sides(facing: u8) -> [u8; 2] {
+    match facing {
+        2 | 3 => [4, 5], // North/South -> West/East
+        _ => [2, 3],     // West/East -> North/South
+    }
+}
+
 /// Mutable block access trait implemented by `WorldStore` (and unit-test worlds).
 pub trait BlockWorld {
     fn get_block_state(&mut self, pos: BlockPos) -> BlockStateId;
     fn set_block_state(&mut self, pos: BlockPos, state: BlockStateId) -> bool;
+
+    /// Analog comparator fullness signal (0..=15) for a container block entity at `pos`.
+    fn container_comparator_signal(&self, _pos: BlockPos) -> u8 {
+        0
+    }
+}
+
+/// Compute a comparator's analog output (0..=15) using vanilla compare/subtract rules.
+fn comparator_output_inner<W: BlockWorld>(
+    world: &mut W,
+    pos: BlockPos,
+    facing: u8,
+    subtract: bool,
+    depth: u8,
+) -> u8 {
+    if depth > 8 || facing >= 6 {
+        return 0;
+    }
+    let (dx, dy, dz) = dir_offset(facing);
+    let back_pos = pos.offset(dx, dy, dz);
+    let mut back_sig = direct_signal_inner(world, back_pos, opposite_dir(facing), depth + 1)
+        .max(world.container_comparator_signal(back_pos));
+
+    let back_st = world.get_block_state(back_pos);
+    if back_st.props().can_occlude() {
+        // Solid block behind comparator can pass both strong power AND a container behind it
+        back_sig = back_sig.max(best_neighbor_signal_inner(world, back_pos, depth + 1));
+        let behind_solid = back_pos.offset(dx, dy, dz);
+        let c_sig = world.container_comparator_signal(behind_solid);
+        if back_sig < 15 && c_sig > 0 {
+            back_sig = back_sig.max(c_sig);
+        }
+    }
+
+    let mut side_sig = 0u8;
+    for sdir in horizontal_sides(facing) {
+        let (sx, sy, sz) = dir_offset(sdir);
+        let sp = pos.offset(sx, sy, sz);
+        let skind = block_behavior(world.get_block_state(sp).0).kind;
+        if matches!(
+            skind,
+            KIND_REDSTONE_WIRE | KIND_REPEATER | KIND_COMPARATOR | KIND_REDSTONE_BLOCK
+        ) {
+            side_sig = side_sig.max(direct_signal_inner(world, sp, opposite_dir(sdir), depth + 1));
+        }
+    }
+
+    if subtract {
+        back_sig.saturating_sub(side_sig)
+    } else if back_sig >= side_sig {
+        back_sig
+    } else {
+        0
+    }
 }
 
 /// Direct signal emitted by the block at `src_pos` toward `toward_dir` (0..=5).
@@ -57,6 +120,18 @@ pub fn direct_signal_toward<W: BlockWorld>(
     src_pos: BlockPos,
     toward_dir: u8,
 ) -> u8 {
+    direct_signal_inner(world, src_pos, toward_dir, 0)
+}
+
+fn direct_signal_inner<W: BlockWorld>(
+    world: &mut W,
+    src_pos: BlockPos,
+    toward_dir: u8,
+    depth: u8,
+) -> u8 {
+    if depth > 8 {
+        return 0;
+    }
     let st = world.get_block_state(src_pos);
     let beh = block_behavior(st.0);
     match beh.kind {
@@ -82,10 +157,22 @@ pub fn direct_signal_toward<W: BlockWorld>(
                 if toward_dir == attached_dir { 0 } else { 15 }
             }
         }
-        KIND_REPEATER => {
-            // Repeater outputs in opposite of its `facing` direction
+        KIND_REPEATER | KIND_OBSERVER => {
             if beh.is_powered() && opposite_dir(beh.facing) == toward_dir {
                 15
+            } else {
+                0
+            }
+        }
+        KIND_COMPARATOR => {
+            if beh.is_powered() && opposite_dir(beh.facing) == toward_dir {
+                comparator_output_inner(
+                    world,
+                    src_pos,
+                    beh.facing,
+                    beh.is_subtract_mode(),
+                    depth + 1,
+                )
             } else {
                 0
             }
@@ -96,7 +183,15 @@ pub fn direct_signal_toward<W: BlockWorld>(
 }
 
 /// Strong signal emitted by `src_pos` into an adjacent solid conductor block.
-fn strong_signal_into<W: BlockWorld>(world: &mut W, src_pos: BlockPos, toward_dir: u8) -> u8 {
+fn strong_signal_into<W: BlockWorld>(
+    world: &mut W,
+    src_pos: BlockPos,
+    toward_dir: u8,
+    depth: u8,
+) -> u8 {
+    if depth > 8 {
+        return 0;
+    }
     let st = world.get_block_state(src_pos);
     let beh = block_behavior(st.0);
     match beh.kind {
@@ -114,9 +209,22 @@ fn strong_signal_into<W: BlockWorld>(world: &mut W, src_pos: BlockPos, toward_di
                 0
             }
         }
-        KIND_REPEATER => {
+        KIND_REPEATER | KIND_OBSERVER => {
             if beh.is_powered() && opposite_dir(beh.facing) == toward_dir {
                 15
+            } else {
+                0
+            }
+        }
+        KIND_COMPARATOR => {
+            if beh.is_powered() && opposite_dir(beh.facing) == toward_dir {
+                comparator_output_inner(
+                    world,
+                    src_pos,
+                    beh.facing,
+                    beh.is_subtract_mode(),
+                    depth + 1,
+                )
             } else {
                 0
             }
@@ -128,11 +236,18 @@ fn strong_signal_into<W: BlockWorld>(world: &mut W, src_pos: BlockPos, toward_di
 /// Compute highest redstone signal (0..=15) received by `pos` from its 6 neighbors
 /// (including strong-powered solid conductor blocks).
 pub fn best_neighbor_signal<W: BlockWorld>(world: &mut W, pos: BlockPos) -> u8 {
+    best_neighbor_signal_inner(world, pos, 0)
+}
+
+fn best_neighbor_signal_inner<W: BlockWorld>(world: &mut W, pos: BlockPos, depth: u8) -> u8 {
+    if depth > 8 {
+        return 0;
+    }
     let mut best = 0u8;
     for &(dx, dy, dz, dir_to_neighbor) in &DIRS {
         let np = pos.offset(dx, dy, dz);
         let from_neighbor_dir = opposite_dir(dir_to_neighbor);
-        best = best.max(direct_signal_toward(world, np, from_neighbor_dir));
+        best = best.max(direct_signal_inner(world, np, from_neighbor_dir, depth + 1));
 
         // Solid conductor block check (receives strong power from any of its neighbors)
         let nst = world.get_block_state(np);
@@ -142,7 +257,7 @@ pub fn best_neighbor_signal<W: BlockWorld>(world: &mut W, pos: BlockPos) -> u8 {
                 if np2 == pos {
                     continue;
                 }
-                best = best.max(strong_signal_into(world, np2, opposite_dir(d2)));
+                best = best.max(strong_signal_into(world, np2, opposite_dir(d2), depth + 1));
             }
         }
         if best == 15 {
@@ -152,7 +267,45 @@ pub fn best_neighbor_signal<W: BlockWorld>(world: &mut W, pos: BlockPos) -> u8 {
     best
 }
 
-/// Handle right-click player interaction with levers, buttons, doors, trapdoors, and fence gates.
+/// Trigger a pressure plate when a player/mob/item stands on `pos`.
+/// Schedules automatic release after 20 ticks (1.0s).
+pub fn trigger_pressure_plate<W: BlockWorld>(
+    world: &mut W,
+    scheduler: &mut TickScheduler,
+    current_tick: u64,
+    pos: BlockPos,
+) -> Vec<(BlockPos, BlockStateId)> {
+    let st = world.get_block_state(pos);
+    let beh = block_behavior(st.0);
+    if beh.kind != KIND_PRESSURE_PLATE {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    if !beh.is_powered() {
+        if let Some(next_id) = beh.toggled_powered() {
+            let ns = BlockStateId(next_id);
+            world.set_block_state(pos, ns);
+            changed.push((pos, ns));
+            changed.extend(propagate_neighbor_updates(
+                world,
+                scheduler,
+                current_tick,
+                &[pos],
+            ));
+        }
+    }
+    scheduler.schedule(
+        current_tick,
+        20,
+        0,
+        pos,
+        ScheduledTickKind::PressurePlateRelease,
+    );
+    changed
+}
+
+/// Handle right-click player interaction with levers, buttons, repeaters, comparators,
+/// doors, trapdoors, and fence gates.
 /// Returns `Some(changed_blocks)` if the block intercepted the right-click (suppressing block placement).
 pub fn interact_block<W: BlockWorld>(
     world: &mut W,
@@ -185,6 +338,18 @@ pub fn interact_block<W: BlockWorld>(
                 30
             };
             scheduler.schedule(current_tick, delay, -1, pos, ScheduledTickKind::ButtonUnpress);
+            seeds.push(pos);
+        }
+        KIND_REPEATER => {
+            let next = BlockStateId(cycle_repeater_delay(st.0)?);
+            world.set_block_state(pos, next);
+            changed.push((pos, next));
+            seeds.push(pos);
+        }
+        KIND_COMPARATOR => {
+            let next = BlockStateId(toggle_comparator_mode(st.0)?);
+            world.set_block_state(pos, next);
+            changed.push((pos, next));
             seeds.push(pos);
         }
         KIND_DOOR => {
@@ -249,6 +414,31 @@ fn enqueue_with_conductors<W: BlockWorld>(
     }
 }
 
+/// Notify any adjacent Observer whose watched face points directly at `changed_pos`.
+fn notify_observers<W: BlockWorld>(
+    world: &mut W,
+    scheduler: &mut TickScheduler,
+    current_tick: u64,
+    changed_pos: BlockPos,
+) {
+    for &(dx, dy, dz, _) in &DIRS {
+        let obs_pos = changed_pos.offset(dx, dy, dz);
+        let obs_beh = block_behavior(world.get_block_state(obs_pos).0);
+        if obs_beh.kind == KIND_OBSERVER && !obs_beh.is_powered() && obs_beh.facing < 6 {
+            let (fx, fy, fz) = dir_offset(obs_beh.facing);
+            if obs_pos.offset(fx, fy, fz) == changed_pos {
+                scheduler.schedule(
+                    current_tick,
+                    2,
+                    -2,
+                    obs_pos,
+                    ScheduledTickKind::ObserverPulseStart,
+                );
+            }
+        }
+    }
+}
+
 /// Propagate deterministic redstone & neighbor updates starting from `seeds` (placed/broken/toggled positions).
 /// Returns every `(BlockPos, new_state)` mutated during propagation.
 pub fn propagate_neighbor_updates<W: BlockWorld>(
@@ -262,6 +452,7 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
     let mut changed: Vec<(BlockPos, BlockStateId)> = Vec::new();
 
     for &s in seeds {
+        notify_observers(world, scheduler, current_tick, s);
         enqueue_with_conductors(world, &mut queue, &mut queued, s);
     }
 
@@ -297,8 +488,12 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                             for &(dx2, dy2, dz2, d2) in &DIRS {
                                 let np2 = np.offset(dx2, dy2, dz2);
                                 if np2 != pos {
-                                    target_power = target_power
-                                        .max(strong_signal_into(world, np2, opposite_dir(d2)));
+                                    target_power = target_power.max(strong_signal_into(
+                                        world,
+                                        np2,
+                                        opposite_dir(d2),
+                                        0,
+                                    ));
                                 }
                             }
                         }
@@ -309,6 +504,7 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                         let ns = BlockStateId(new_id);
                         world.set_block_state(pos, ns);
                         changed.push((pos, ns));
+                        notify_observers(world, scheduler, current_tick, pos);
                         enqueue_with_conductors(world, &mut queue, &mut queued, pos);
                     }
                 }
@@ -320,6 +516,7 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                         let ns = BlockStateId(new_id);
                         world.set_block_state(pos, ns);
                         changed.push((pos, ns));
+                        notify_observers(world, scheduler, current_tick, pos);
                     }
                 }
             }
@@ -357,6 +554,26 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                         pos,
                         ScheduledTickKind::RepeaterUpdate,
                     );
+                }
+            }
+            KIND_COMPARATOR => {
+                let out = comparator_output_inner(world, pos, beh.facing, beh.is_subtract_mode(), 0);
+                let should_power = out > 0;
+                if should_power != beh.is_powered() {
+                    scheduler.schedule(
+                        current_tick,
+                        2,
+                        -2,
+                        pos,
+                        ScheduledTickKind::ComparatorUpdate,
+                    );
+                } else if should_power {
+                    // Output analog level may have shifted (e.g. chest count changed): update front neighbor!
+                    let (ox, oy, oz) = dir_offset(opposite_dir(beh.facing));
+                    let front = pos.offset(ox, oy, oz);
+                    if queued.insert(front) {
+                        queue.push_back(front);
+                    }
                 }
             }
             KIND_DOOR | KIND_TRAPDOOR | KIND_FENCE_GATE => {
@@ -433,16 +650,19 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                                 let dst = bp.offset(dx, dy, dz);
                                 world.set_block_state(dst, bs);
                                 changed.push((dst, bs));
+                                notify_observers(world, scheduler, current_tick, dst);
                                 enqueue_with_conductors(world, &mut queue, &mut queued, dst);
                             }
                             let head_pos = pos.offset(dx, dy, dz);
-                            let head_st =
-                                BlockStateId(PISTON_HEAD_STATES[beh.facing as usize][usize::from(is_sticky)]);
+                            let head_st = BlockStateId(
+                                PISTON_HEAD_STATES[beh.facing as usize][usize::from(is_sticky)],
+                            );
                             world.set_block_state(head_pos, head_st);
                             changed.push((head_pos, head_st));
                             let ext_st = BlockStateId(ext_id);
                             world.set_block_state(pos, ext_st);
                             changed.push((pos, ext_st));
+                            notify_observers(world, scheduler, current_tick, head_pos);
                             enqueue_with_conductors(world, &mut queue, &mut queued, head_pos);
                         }
                     }
@@ -456,16 +676,24 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                         let head_pos = pos.offset(dx, dy, dz);
                         let pulled_pos = pos.offset(dx * 2, dy * 2, dz * 2);
                         let pulled_st = world.get_block_state(pulled_pos);
-                        if is_sticky && !pulled_st.is_air() && !pulled_st.props().can_be_replaced() && !is_piston_immovable(pulled_st) {
+                        if is_sticky
+                            && !pulled_st.is_air()
+                            && !pulled_st.props().can_be_replaced()
+                            && !is_piston_immovable(pulled_st)
+                        {
                             world.set_block_state(head_pos, pulled_st);
                             changed.push((head_pos, pulled_st));
                             world.set_block_state(pulled_pos, BlockStateId::AIR);
                             changed.push((pulled_pos, BlockStateId::AIR));
+                            notify_observers(world, scheduler, current_tick, pulled_pos);
                             enqueue_with_conductors(world, &mut queue, &mut queued, pulled_pos);
-                        } else if block_behavior(world.get_block_state(head_pos).0).kind == KIND_PISTON_HEAD {
+                        } else if block_behavior(world.get_block_state(head_pos).0).kind
+                            == KIND_PISTON_HEAD
+                        {
                             world.set_block_state(head_pos, BlockStateId::AIR);
                             changed.push((head_pos, BlockStateId::AIR));
                         }
+                        notify_observers(world, scheduler, current_tick, head_pos);
                         enqueue_with_conductors(world, &mut queue, &mut queued, head_pos);
                     }
                 }
@@ -492,6 +720,21 @@ pub fn execute_scheduled_tick<W: BlockWorld>(
     match tick.kind {
         ScheduledTickKind::ButtonUnpress => {
             if beh.kind == KIND_BUTTON && beh.is_powered() {
+                if let Some(new_id) = beh.toggled_powered() {
+                    let ns = BlockStateId(new_id);
+                    world.set_block_state(tick.pos, ns);
+                    changed.push((tick.pos, ns));
+                    changed.extend(propagate_neighbor_updates(
+                        world,
+                        scheduler,
+                        current_tick,
+                        &[tick.pos],
+                    ));
+                }
+            }
+        }
+        ScheduledTickKind::PressurePlateRelease => {
+            if beh.kind == KIND_PRESSURE_PLATE && beh.is_powered() {
                 if let Some(new_id) = beh.toggled_powered() {
                     let ns = BlockStateId(new_id);
                     world.set_block_state(tick.pos, ns);
@@ -548,6 +791,62 @@ pub fn execute_scheduled_tick<W: BlockWorld>(
                             &[tick.pos],
                         ));
                     }
+                }
+            }
+        }
+        ScheduledTickKind::ComparatorUpdate => {
+            if beh.kind == KIND_COMPARATOR {
+                let out = comparator_output_inner(world, tick.pos, beh.facing, beh.is_subtract_mode(), 0);
+                let should_power = out > 0;
+                if should_power != beh.is_powered() {
+                    if let Some(new_id) = beh.toggled_powered() {
+                        let ns = BlockStateId(new_id);
+                        world.set_block_state(tick.pos, ns);
+                        changed.push((tick.pos, ns));
+                        changed.extend(propagate_neighbor_updates(
+                            world,
+                            scheduler,
+                            current_tick,
+                            &[tick.pos],
+                        ));
+                    }
+                }
+            }
+        }
+        ScheduledTickKind::ObserverPulseStart => {
+            if beh.kind == KIND_OBSERVER && !beh.is_powered() {
+                if let Some(new_id) = beh.toggled_powered() {
+                    let ns = BlockStateId(new_id);
+                    world.set_block_state(tick.pos, ns);
+                    changed.push((tick.pos, ns));
+                    scheduler.schedule(
+                        current_tick,
+                        2,
+                        -2,
+                        tick.pos,
+                        ScheduledTickKind::ObserverPulseEnd,
+                    );
+                    changed.extend(propagate_neighbor_updates(
+                        world,
+                        scheduler,
+                        current_tick,
+                        &[tick.pos],
+                    ));
+                }
+            }
+        }
+        ScheduledTickKind::ObserverPulseEnd => {
+            if beh.kind == KIND_OBSERVER && beh.is_powered() {
+                if let Some(new_id) = beh.toggled_powered() {
+                    let ns = BlockStateId(new_id);
+                    world.set_block_state(tick.pos, ns);
+                    changed.push((tick.pos, ns));
+                    changed.extend(propagate_neighbor_updates(
+                        world,
+                        scheduler,
+                        current_tick,
+                        &[tick.pos],
+                    ));
                 }
             }
         }
@@ -615,23 +914,38 @@ fn is_piston_immovable(st: BlockStateId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mc_data::block_behaviors::resolve_placement;
     use mc_data::default_state_id;
     use std::collections::HashMap;
 
-    struct MapWorld(HashMap<BlockPos, BlockStateId>);
+    struct MapWorld {
+        blocks: HashMap<BlockPos, BlockStateId>,
+        container_signals: HashMap<BlockPos, u8>,
+    }
+    impl MapWorld {
+        fn new() -> Self {
+            Self {
+                blocks: HashMap::new(),
+                container_signals: HashMap::new(),
+            }
+        }
+    }
     impl BlockWorld for MapWorld {
         fn get_block_state(&mut self, pos: BlockPos) -> BlockStateId {
-            self.0.get(&pos).copied().unwrap_or(BlockStateId::AIR)
+            self.blocks.get(&pos).copied().unwrap_or(BlockStateId::AIR)
         }
         fn set_block_state(&mut self, pos: BlockPos, state: BlockStateId) -> bool {
-            self.0.insert(pos, state);
+            self.blocks.insert(pos, state);
             true
+        }
+        fn container_comparator_signal(&self, pos: BlockPos) -> u8 {
+            self.container_signals.get(&pos).copied().unwrap_or(0)
         }
     }
 
     #[test]
     fn lever_powers_wire_chain_and_lights_redstone_lamp() {
-        let mut w = MapWorld(HashMap::new());
+        let mut w = MapWorld::new();
         let mut sched = TickScheduler::new();
 
         let lever = default_state_id("minecraft:lever").unwrap();
@@ -643,7 +957,6 @@ mod tests {
         w.set_block_state(BlockPos::new(2, 0, 0), wire);
         w.set_block_state(BlockPos::new(3, 0, 0), lamp);
 
-        // Toggle lever ON
         let changed = interact_block(&mut w, &mut sched, 1, BlockPos::new(0, 0, 0)).unwrap();
         assert!(!changed.is_empty());
         assert_eq!(block_behavior(w.get_block_state(BlockPos::new(1, 0, 0)).0).power(), 15);
@@ -652,7 +965,6 @@ mod tests {
         assert!(block_behavior(lit_lamp.0).is_lit());
         assert_eq!(lit_lamp.props().light_emission, 15);
 
-        // Toggle lever OFF -> wire decays to 0 and lamp turns OFF!
         interact_block(&mut w, &mut sched, 2, BlockPos::new(0, 0, 0)).unwrap();
         assert_eq!(block_behavior(w.get_block_state(BlockPos::new(1, 0, 0)).0).power(), 0);
         assert_eq!(block_behavior(w.get_block_state(BlockPos::new(2, 0, 0)).0).power(), 0);
@@ -661,7 +973,7 @@ mod tests {
 
     #[test]
     fn redstone_torch_inverts_after_2_ticks_and_button_unpresses() {
-        let mut w = MapWorld(HashMap::new());
+        let mut w = MapWorld::new();
         let mut sched = TickScheduler::new();
 
         let btn = default_state_id("minecraft:stone_button").unwrap();
@@ -671,7 +983,6 @@ mod tests {
         w.set_block_state(BlockPos::new(1, 1, 0), torch);
         assert!(block_behavior(w.get_block_state(BlockPos::new(1, 1, 0)).0).is_lit());
 
-        // Press stone button at tick 10 -> schedules torch turn-off at tick 12 and button unpress at tick 30
         interact_block(&mut w, &mut sched, 10, BlockPos::new(0, 0, 0)).unwrap();
         assert!(block_behavior(w.get_block_state(BlockPos::new(0, 0, 0)).0).is_powered());
 
@@ -694,29 +1005,139 @@ mod tests {
     #[test]
     fn sticky_piston_pushes_and_retracts_block_chain() {
         use mc_data::block_behaviors::STICKY_PISTON_STATES;
-        let mut w = MapWorld(HashMap::new());
+        let mut w = MapWorld::new();
         let mut sched = TickScheduler::new();
 
         let lever = default_state_id("minecraft:lever").unwrap();
-        // Sticky piston facing East (dir 5), retracted
         let spiston = BlockStateId(STICKY_PISTON_STATES[5][0]);
         w.set_block_state(BlockPos::new(0, 0, 0), lever);
         w.set_block_state(BlockPos::new(1, 0, 0), spiston);
         w.set_block_state(BlockPos::new(2, 0, 0), BlockStateId::STONE);
         w.set_block_state(BlockPos::new(3, 0, 0), BlockStateId::DIRT);
 
-        // Power lever ON -> piston extends, pushing stone to x=3 and dirt to x=4!
         interact_block(&mut w, &mut sched, 1, BlockPos::new(0, 0, 0)).unwrap();
         assert!(block_behavior(w.get_block_state(BlockPos::new(1, 0, 0)).0).is_open());
         assert_eq!(block_behavior(w.get_block_state(BlockPos::new(2, 0, 0)).0).kind, KIND_PISTON_HEAD);
         assert_eq!(w.get_block_state(BlockPos::new(3, 0, 0)), BlockStateId::STONE);
         assert_eq!(w.get_block_state(BlockPos::new(4, 0, 0)), BlockStateId::DIRT);
 
-        // Power lever OFF -> sticky piston retracts and pulls stone back from x=3 to x=2!
         interact_block(&mut w, &mut sched, 2, BlockPos::new(0, 0, 0)).unwrap();
         assert!(!block_behavior(w.get_block_state(BlockPos::new(1, 0, 0)).0).is_open());
         assert_eq!(w.get_block_state(BlockPos::new(2, 0, 0)), BlockStateId::STONE);
         assert_eq!(w.get_block_state(BlockPos::new(3, 0, 0)), BlockStateId::AIR);
         assert_eq!(w.get_block_state(BlockPos::new(4, 0, 0)), BlockStateId::DIRT);
+    }
+
+    #[test]
+    fn comparator_reads_container_signal_subtracts_and_observer_pulses_lamp() {
+        let mut w = MapWorld::new();
+        let mut sched = TickScheduler::new();
+
+        // Comparator default facing=north (back is North = (0,0,-1), output is South = (0,0,+1))
+        let chest = default_state_id("minecraft:chest").unwrap();
+        let comp = default_state_id("minecraft:comparator").unwrap();
+        let wire = default_state_id("minecraft:redstone_wire").unwrap();
+        let rep = default_state_id("minecraft:repeater").unwrap();
+
+        w.set_block_state(BlockPos::new(0, 0, -1), chest);
+        w.container_signals.insert(BlockPos::new(0, 0, -1), 10);
+        w.set_block_state(BlockPos::new(0, 0, 0), comp);
+        w.set_block_state(BlockPos::new(0, 0, 1), wire);
+        // Real redstone chain feeding side input at (1, 0, 0) with sustained signal strength 5
+        // (redstone_block at x=12 -> wires x=11(15)..x=1(5))
+        let rblock = default_state_id("minecraft:redstone_block").unwrap();
+        w.set_block_state(BlockPos::new(12, 0, 0), rblock);
+        for x in 1..=11 {
+            w.set_block_state(BlockPos::new(x, 0, 0), wire);
+        }
+        propagate_neighbor_updates(&mut w, &mut sched, 1, &[BlockPos::new(12, 0, 0)]);
+        assert_eq!(block_behavior(w.get_block_state(BlockPos::new(1, 0, 0)).0).power(), 5);
+
+        // Trigger update -> schedules ComparatorUpdate at tick 3
+        propagate_neighbor_updates(&mut w, &mut sched, 1, &[BlockPos::new(0, 0, -1)]);
+        for t in 2..=4 {
+            for due in sched.drain_due(t) {
+                execute_scheduled_tick(&mut w, &mut sched, t, due);
+            }
+        }
+        assert!(block_behavior(w.get_block_state(BlockPos::new(0, 0, 0)).0).is_powered());
+        // Compare mode: 10 >= 5 -> output = 10
+        assert_eq!(block_behavior(w.get_block_state(BlockPos::new(0, 0, 1)).0).power(), 10);
+
+        // Right-click comparator -> switches to subtract mode -> 10 - 5 = 5!
+        interact_block(&mut w, &mut sched, 5, BlockPos::new(0, 0, 0)).unwrap();
+        assert!(block_behavior(w.get_block_state(BlockPos::new(0, 0, 0)).0).is_subtract_mode());
+        assert_eq!(block_behavior(w.get_block_state(BlockPos::new(0, 0, 1)).0).power(), 5);
+
+        // Right-click repeater cycles delay 1 -> 2
+        w.set_block_state(BlockPos::new(5, 0, 5), rep);
+        assert_eq!(block_behavior(w.get_block_state(BlockPos::new(5, 0, 5)).0).delay(), 1);
+        interact_block(&mut w, &mut sched, 6, BlockPos::new(5, 0, 5)).unwrap();
+        assert_eq!(block_behavior(w.get_block_state(BlockPos::new(5, 0, 5)).0).delay(), 2);
+
+        // Observer facing=south (watches (10,0,11), outputs North to (10,0,9))
+        let obs = default_state_id("minecraft:observer").unwrap();
+        let lamp = default_state_id("minecraft:redstone_lamp").unwrap();
+        w.set_block_state(BlockPos::new(10, 0, 10), obs);
+        w.set_block_state(BlockPos::new(10, 0, 9), lamp);
+        w.set_block_state(BlockPos::new(10, 0, 11), BlockStateId::STONE);
+        propagate_neighbor_updates(&mut w, &mut sched, 10, &[BlockPos::new(10, 0, 11)]);
+        for t in 11..=12 {
+            for due in sched.drain_due(t) {
+                execute_scheduled_tick(&mut w, &mut sched, t, due);
+            }
+        }
+        assert!(block_behavior(w.get_block_state(BlockPos::new(10, 0, 10)).0).is_powered());
+        assert!(block_behavior(w.get_block_state(BlockPos::new(10, 0, 9)).0).is_lit());
+        for t in 13..=15 {
+            for due in sched.drain_due(t) {
+                execute_scheduled_tick(&mut w, &mut sched, t, due);
+            }
+        }
+        assert!(!block_behavior(w.get_block_state(BlockPos::new(10, 0, 10)).0).is_powered());
+        assert!(!block_behavior(w.get_block_state(BlockPos::new(10, 0, 9)).0).is_lit());
+
+        // Pressure plate activation + 20-tick automatic release
+        let plate = default_state_id("minecraft:oak_pressure_plate").unwrap();
+        w.set_block_state(BlockPos::new(20, 0, 0), plate);
+        w.set_block_state(BlockPos::new(21, 0, 0), lamp);
+        trigger_pressure_plate(&mut w, &mut sched, 20, BlockPos::new(20, 0, 0));
+        assert!(block_behavior(w.get_block_state(BlockPos::new(20, 0, 0)).0).is_powered());
+        assert!(block_behavior(w.get_block_state(BlockPos::new(21, 0, 0)).0).is_lit());
+        for t in 21..=41 {
+            for due in sched.drain_due(t) {
+                execute_scheduled_tick(&mut w, &mut sched, t, due);
+            }
+        }
+        assert!(!block_behavior(w.get_block_state(BlockPos::new(20, 0, 0)).0).is_powered());
+        assert!(!block_behavior(w.get_block_state(BlockPos::new(21, 0, 0)).0).is_lit());
+    }
+
+    #[test]
+    fn placement_orientation_tables_handle_logs_slabs_stairs_doors_and_wall_torches() {
+        // Oak log clicked on East face (5) -> axis=x != default axis=y
+        let oak_log = default_state_id("minecraft:oak_log").unwrap().0;
+        let log_x = resolve_placement(oak_log, 5, 0.5, 0.0, 0.0, BlockStateId::STONE.0);
+        assert_ne!(log_x.primary_state, oak_log);
+
+        // Stone slab placed on top half + merged into double slab when clicking existing slab
+        let slab = default_state_id("minecraft:stone_slab").unwrap().0;
+        let top_slab = resolve_placement(slab, 2, 0.8, 0.0, 0.0, BlockStateId::STONE.0);
+        assert_ne!(top_slab.primary_state, slab);
+        let dbl_slab = resolve_placement(slab, 1, 1.0, 0.0, 0.0, top_slab.primary_state);
+        assert!(dbl_slab.replace_clicked);
+        assert_ne!(dbl_slab.primary_state, top_slab.primary_state);
+
+        // Oak door places lower + upper secondary at (0, 1, 0)
+        let door = default_state_id("minecraft:oak_door").unwrap().0;
+        let placed_door = resolve_placement(door, 1, 1.0, 90.0, 0.0, BlockStateId::STONE.0);
+        let (dx, dy, dz, upper) = placed_door.secondary.expect("door must place upper half");
+        assert_eq!((dx, dy, dz), (0, 1, 0));
+        assert!(block_behavior(upper).is_upper_or_wall());
+
+        // Torch clicked on East face -> wall_torch!
+        let torch = default_state_id("minecraft:torch").unwrap().0;
+        let wtorch = resolve_placement(torch, 5, 0.5, 0.0, 0.0, BlockStateId::STONE.0);
+        assert_eq!(BlockStateId(wtorch.primary_state).block_name(), "minecraft:wall_torch");
     }
 }

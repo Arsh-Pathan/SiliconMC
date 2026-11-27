@@ -8,6 +8,10 @@ pub enum ScheduledTickKind {
     ButtonUnpress,
     RedstoneTorchUpdate,
     RepeaterUpdate,
+    ComparatorUpdate,
+    ObserverPulseStart,
+    ObserverPulseEnd,
+    PressurePlateRelease,
     FallingBlockCheck,
     FluidTick,
 }

@@ -142,6 +142,30 @@ impl BlockEntity {
         }
     }
 
+    /// Exact Minecraft `AbstractContainerMenu.getRedstoneSignalFromContainer` analog output (0..=15).
+    pub fn comparator_signal(&self) -> u8 {
+        let Some(slots) = self.items_slice() else {
+            return 0;
+        };
+        if slots.is_empty() {
+            return 0;
+        }
+        let mut fullness = 0.0_f32;
+        let mut non_empty = 0usize;
+        for s in slots {
+            if !s.is_empty() {
+                let max_st = s.max_stack_size().max(1) as f32;
+                fullness += (s.count as f32) / max_st;
+                non_empty += 1;
+            }
+        }
+        if non_empty == 0 {
+            return 0;
+        }
+        let ratio = fullness / (slots.len() as f32);
+        ((ratio * 14.0).floor() as u8 + 1).min(15)
+    }
+
     /// Try inserting 1 item of `stack` into this container (respecting furnace face rules:
     /// `from_dir == 1` (from above) -> input slot 0; side -> fuel slot 1).
     pub fn try_insert_one(&mut self, item: &ItemStack, from_top: bool) -> bool {
