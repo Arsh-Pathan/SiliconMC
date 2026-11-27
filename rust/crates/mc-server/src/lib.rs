@@ -6,11 +6,13 @@ pub mod config;
 pub mod extra_commands;
 pub mod gamerules;
 pub mod jsonrpc;
+pub mod live_entities;
 pub mod playerdata;
 pub mod query;
 pub mod rcon;
 pub mod scoreboard;
 pub mod server;
+pub mod workstation_menus;
 pub mod world_loader;
 
 pub use config::ServerConfig;

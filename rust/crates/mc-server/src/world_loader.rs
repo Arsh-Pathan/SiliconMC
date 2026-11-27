@@ -2,16 +2,16 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use mc_data::block_behaviors::{
-    KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_FURNACE, KIND_HOPPER, KIND_SIGN, KIND_SMOKER,
-    block_behavior,
+    KIND_BARREL, KIND_BLAST_FURNACE, KIND_BREWING_STAND, KIND_CHEST, KIND_DISPENSER, KIND_DROPPER,
+    KIND_FURNACE, KIND_HOPPER, KIND_SIGN, KIND_SMOKER, block_behavior,
 };
 use mc_data::recipes::{COOK_BLASTING, COOK_SMELTING, COOK_SMOKING};
 use mc_data::{BlockStateId, LoadedDatapacks, WORLD_VERSION};
 use mc_math::{BlockPos, ChunkPos};
 use mc_nbt::{NbtCompound, NbtTag};
 use mc_world::{
-    BlockEntity, BlockEntityKind, BlockWorld, Chunk, DirtyLightSections, FurnaceTickResult,
-    LightEngine, OVERWORLD_MIN_SECTION_Y, OVERWORLD_SECTION_COUNT, RegionFile,
+    BlockEntity, BlockEntityKind, BlockWorld, Chunk, DirtyLightSections, EntityRegionStore,
+    FurnaceTickResult, LightEngine, OVERWORLD_MIN_SECTION_Y, OVERWORLD_SECTION_COUNT, RegionFile,
     best_neighbor_signal,
 };
 use mc_worldgen::{
@@ -65,6 +65,14 @@ impl DimensionId {
             Self::Overworld => "region",
             Self::Nether => "DIM-1/region",
             Self::End => "DIM1/region",
+        }
+    }
+
+    pub fn entities_subdir(self) -> &'static str {
+        match self {
+            Self::Overworld => "entities",
+            Self::Nether => "DIM-1/entities",
+            Self::End => "DIM1/entities",
         }
     }
 }
@@ -407,6 +415,9 @@ impl WorldStore {
             KIND_BLAST_FURNACE => Some(BlockEntity::new_furnace(pos, COOK_BLASTING)),
             KIND_SMOKER => Some(BlockEntity::new_furnace(pos, COOK_SMOKING)),
             KIND_HOPPER => Some(BlockEntity::new_hopper(pos)),
+            KIND_BREWING_STAND => Some(BlockEntity::new_brewing_stand(pos)),
+            KIND_DISPENSER => Some(BlockEntity::new_dispenser(pos, false)),
+            KIND_DROPPER => Some(BlockEntity::new_dispenser(pos, true)),
             KIND_SIGN => Some(BlockEntity::new_sign(pos)),
             _ => None,
         }
@@ -484,6 +495,106 @@ impl WorldStore {
             }
         }
         updates
+    }
+
+    /// Tick all loaded Brewing Stand block entities for 1 server tick.
+    /// Returns `(pos, brew_time, fuel, slots_changed)` for every brewing stand that changed.
+    pub fn tick_brewing_stands(&mut self) -> Vec<(BlockPos, i16, u8, bool)> {
+        let mut updates = Vec::new();
+        for chunk in self.chunks.values_mut() {
+            let mut chunk_dirty = false;
+            for (&pos, be) in chunk.block_entities.iter_mut() {
+                if let BlockEntityKind::BrewingStand { state } = &mut be.kind {
+                    let prev_slots = state.slots.clone();
+                    if state.tick_brewing() {
+                        chunk_dirty = true;
+                        let slots_changed = state.slots != prev_slots;
+                        updates.push((pos, state.brew_time, state.fuel, slots_changed));
+                    }
+                }
+            }
+            if chunk_dirty {
+                chunk.dirty = true;
+            }
+        }
+        updates
+    }
+
+    /// Return the per-dimension Entity `.mca` region store (`<dim_dir>/entities/r.<rx>.<rz>.mca`).
+    pub fn entity_store(&self, dim: DimensionId) -> EntityRegionStore {
+        EntityRegionStore::new(self.world_dir.join(dim.entities_subdir()))
+    }
+
+    /// Save a chunk if dirty and remove it from memory. Returns `Ok(true)` if it was loaded.
+    pub fn unload_chunk(&mut self, dim: DimensionId, pos: ChunkPos) -> Result<bool, String> {
+        let (rdir, map) = match dim {
+            DimensionId::Overworld => (self.region_dir.clone(), &mut self.chunks),
+            DimensionId::Nether => (
+                self.world_dir.join(DimensionId::Nether.region_subdir()),
+                &mut self.nether_chunks,
+            ),
+            DimensionId::End => (
+                self.world_dir.join(DimensionId::End.region_subdir()),
+                &mut self.end_chunks,
+            ),
+        };
+        let Some(chunk) = map.remove(&pos) else {
+            return Ok(false);
+        };
+        if chunk.dirty {
+            std::fs::create_dir_all(&rdir).map_err(|e| e.to_string())?;
+            let mca_path = rdir.join(format!("r.{}.{}.mca", pos.region_x(), pos.region_z()));
+            let mut rf = RegionFile::open(&mca_path).map_err(|e| e.to_string())?;
+            let nbt = chunk.to_nbt(&self.datapacks);
+            rf.write_chunk_nbt(pos, &nbt).map_err(|e| e.to_string())?;
+        }
+        Ok(true)
+    }
+
+    /// Find the highest safe air-above-solid Y coordinate in an already-loaded Overworld chunk.
+    pub fn surface_y_in_loaded_chunk(&self, x: i32, z: i32) -> Option<i32> {
+        let cp = ChunkPos::new(x >> 4, z >> 4);
+        let chunk = self.chunks.get(&cp)?;
+        let lx = (x & 15) as usize;
+        let lz = (z & 15) as usize;
+        let max_y = chunk.max_y();
+        let min_y = chunk.min_y();
+        for sec in chunk.sections.iter().rev() {
+            if sec.non_empty_block_count <= 0 {
+                continue;
+            }
+            let base_y = (sec.y as i32) << 4;
+            for ly in (0..16).rev() {
+                let wy = base_y + ly as i32;
+                if wy < min_y || wy + 2 >= max_y {
+                    continue;
+                }
+                let ground = sec.get_block(lx, ly, lz);
+                if ground.is_air() {
+                    continue;
+                }
+                if ground.is_fluid_block() || ground.props().can_be_replaced() {
+                    return None;
+                }
+                let feet = chunk.get_block(lx, wy + 1, lz);
+                let head = chunk.get_block(lx, wy + 2, lz);
+                if feet.is_air() && head.is_air() {
+                    return Some(wy + 1);
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Returns `true` if `pos` in an already-loaded Overworld chunk has clear sky above it.
+    pub fn is_sky_exposed(&self, pos: BlockPos) -> bool {
+        let Some(chunk) = self.chunks.get(&pos.chunk_pos()) else {
+            return false;
+        };
+        let lx = (pos.x & 15) as usize;
+        let lz = (pos.z & 15) as usize;
+        chunk.get_sky_light(lx, pos.y.clamp(chunk.min_y(), chunk.max_y() - 1), lz) >= 15
     }
 
     /// Tick all loaded hoppers (8-tick transfer cooldown, redstone lock, pull from above, push to facing).

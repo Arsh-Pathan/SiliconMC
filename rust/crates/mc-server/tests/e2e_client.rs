@@ -1,13 +1,16 @@
+use mc_data::recipes::menu_types;
 use mc_data::{BlockStateId, PROTOCOL_VERSION, VERSION_NAME, default_state_id, packet_ids};
-use mc_math::BlockPos;
+use mc_math::{BlockPos, Vec3};
 use mc_oracle::{OracleClient, with_oracle};
 use mc_proto::{
     BlockHitResult, ClientCommandAction, ClientIntent, Direction, FramedConnection,
     HandshakeIntention, HashedStack, InteractionHand, PacketReader, PacketWriter, PlayerActionType,
     encode_serverbound_chat_command, encode_serverbound_client_command,
     encode_serverbound_container_click, encode_serverbound_container_close,
-    encode_serverbound_player_action, encode_serverbound_set_creative_mode_slot,
+    encode_serverbound_interact, encode_serverbound_player_action, encode_serverbound_player_input,
+    encode_serverbound_rename_item, encode_serverbound_set_creative_mode_slot,
     encode_serverbound_sign_update, encode_serverbound_use_item, encode_serverbound_use_item_on,
+    player_input_flags,
 };
 use mc_server::{MinecraftServer, ServerConfig};
 use mc_world::{ContainerClickType, ItemStack};
@@ -1356,6 +1359,391 @@ async fn e2e_status_login_config_play_chunks_movement_and_chat() {
         .join("advancements")
         .join(format!("{alice_uuid}.json"));
     assert!(adv_file.is_file(), "Advancements JSON not saved for Alice!");
+
+    // 13. Full-Parity Live E2E: All 6 Interactive Workstations (Enchanting, Anvil, Brewing Stand,
+    //     Smithing Table, Stonecutter) + Villager Merchant Trading (`MerchantOffers` oracle-verified)!
+    for (cmd, bp, expected_menu_type, send_rename) in [
+        ("setblock 10 -60 10 enchanting_table", BlockPos::new(10, -60, 10), menu_types::ENCHANTMENT, false),
+        ("setblock 11 -60 10 anvil", BlockPos::new(11, -60, 10), menu_types::ANVIL, true),
+        ("setblock 12 -60 10 brewing_stand", BlockPos::new(12, -60, 10), menu_types::BREWING_STAND, false),
+        ("setblock 13 -60 10 smithing_table", BlockPos::new(13, -60, 10), menu_types::SMITHING, false),
+        ("setblock 14 -60 10 stonecutter", BlockPos::new(14, -60, 10), menu_types::STONECUTTER, false),
+    ] {
+        c1.write_raw_packet(&encode_serverbound_chat_command(cmd))
+            .await
+            .unwrap();
+        c1.write_raw_packet(&encode_serverbound_use_item_on(
+            InteractionHand::MainHand,
+            BlockHitResult {
+                pos: bp,
+                direction: Direction::Up,
+                click_x: 0.5,
+                click_y: 1.0,
+                click_z: 0.5,
+                inside: false,
+                world_border_hit: false,
+            },
+            120,
+        ))
+        .await
+        .unwrap();
+        let mut opened_cid = None;
+        for _ in 0..200 {
+            let raw = tokio::time::timeout(std::time::Duration::from_secs(4), c1.read_raw_packet())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut r = PacketReader::new(&raw);
+            let pid = r.read_varint().unwrap();
+            if pid == packet_ids::play::clientbound::OPEN_SCREEN {
+                let (pt, _, reenc) =
+                    with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+                assert_eq!(pt, "minecraft:open_screen");
+                assert_eq!(reenc, raw);
+                let cid = r.read_varint().unwrap();
+                let mtype = r.read_varint().unwrap();
+                if mtype == expected_menu_type {
+                    opened_cid = Some(cid);
+                    break;
+                }
+            }
+        }
+        let cid = opened_cid.unwrap_or_else(|| {
+            panic!("Expected OpenScreen(menu_type={expected_menu_type}) for `{cmd}`")
+        });
+        if send_rename {
+            c1.write_raw_packet(&encode_serverbound_rename_item("Excalibur"))
+                .await
+                .unwrap();
+        }
+        c1.write_raw_packet(&encode_serverbound_container_close(cid))
+            .await
+            .unwrap();
+    }
+
+    // Summon a Villager, right-click to open Merchant screen + oracle-verify MerchantOffers!
+    let villager_type_id =
+        mc_data::static_registry_protocol_id("minecraft:entity_type", "minecraft:villager")
+            .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("summon villager 10 -60 12"))
+        .await
+        .unwrap();
+    let mut villager_eid = None;
+    for _ in 0..200 {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(4), c1.read_raw_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::ADD_ENTITY {
+            let eid = r.read_varint().unwrap();
+            let _uuid = r.read_uuid().unwrap();
+            let etype = r.read_varint().unwrap();
+            if etype == villager_type_id {
+                villager_eid = Some(eid);
+                break;
+            }
+        }
+    }
+    let veid = villager_eid.expect("Expected AddEntity for summoned villager");
+    c1.write_raw_packet(&encode_serverbound_interact(
+        veid,
+        InteractionHand::MainHand,
+        Vec3::ZERO,
+        false,
+    ))
+    .await
+    .unwrap();
+    let mut got_merchant_open = false;
+    let mut got_merchant_offers = false;
+    let mut merchant_cid = 0;
+    for _ in 0..200 {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(4), c1.read_raw_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::OPEN_SCREEN {
+            let cid = r.read_varint().unwrap();
+            let mtype = r.read_varint().unwrap();
+            if mtype == menu_types::MERCHANT {
+                got_merchant_open = true;
+                merchant_cid = cid;
+            }
+        } else if pid == packet_ids::play::clientbound::MERCHANT_OFFERS {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:merchant_offers");
+            assert_eq!(reenc, raw);
+            got_merchant_offers = true;
+        }
+        if got_merchant_open && got_merchant_offers {
+            break;
+        }
+    }
+    assert!(got_merchant_open, "Expected OpenScreen(MERCHANT) for Villager");
+    assert!(got_merchant_offers, "Expected oracle-verified MerchantOffers packet");
+    c1.write_raw_packet(&encode_serverbound_container_close(merchant_cid))
+        .await
+        .unwrap();
+
+    // 14. Dispenser Redstone Launch + Bed Sleep + Boat Mount/Dismount (`SetPassengers`) +
+    //     Chunk Unload (`ForgetLevelChunk`) + Entity `.mca` Persistence!
+    let arrow_item = ItemStack::from_name("minecraft:arrow", 4).unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("setblock 16 -60 10 dispenser"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &arrow_item))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(16, -60, 10),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 1.0,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        130,
+    ))
+    .await
+    .unwrap();
+    let mut disp_cid = None;
+    for _ in 0..200 {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(4), c1.read_raw_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::OPEN_SCREEN {
+            let cid = r.read_varint().unwrap();
+            let mtype = r.read_varint().unwrap();
+            if mtype == menu_types::GENERIC_3X3 {
+                disp_cid = Some(cid);
+                break;
+            }
+        }
+    }
+    let disp_cid = disp_cid.expect("Expected OpenScreen(GENERIC_3X3) for Dispenser");
+    // Quick-move arrow from hotbar slot 0 (index 36 in 3x3 menu: 9 top + 27 main = 36) into dispenser
+    c1.write_raw_packet(&encode_serverbound_container_click(
+        disp_cid,
+        0,
+        36,
+        0,
+        ContainerClickType::QuickMove,
+        &[],
+        &HashedStack::Empty,
+    ))
+    .await
+    .unwrap();
+    c1.write_raw_packet(&encode_serverbound_container_close(disp_cid))
+        .await
+        .unwrap();
+    // Power the dispenser with an adjacent redstone_block (triggers 4-tick DispenserFire -> launches arrow!)
+    let redstone_blk = ItemStack::from_name("minecraft:redstone_block", 1).unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &redstone_blk))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(16, -61, 11),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 1.0,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        131,
+    ))
+    .await
+    .unwrap();
+
+    // Place a Red Bed, clear Step 10's thunderstorm, move right next to it, test daytime spawnpoint + night sleep
+    c1.write_raw_packet(&encode_serverbound_chat_command("weather clear"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("setblock 18 -60 10 red_bed"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("time set 6000"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_move_pos(18.5, -60.0, 11.2))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(18, -60, 10),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 0.5,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        132,
+    ))
+    .await
+    .unwrap();
+    // Now switch to night (14000) and right-click bed again -> starts sleeping!
+    c1.write_raw_packet(&encode_serverbound_chat_command("time set 14000"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(18, -60, 10),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 0.5,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        134,
+    ))
+    .await
+    .unwrap();
+
+    // Place an Oak Boat via UseItemOn -> mount via Interact -> dismount via Shift PlayerInput!
+    let boat_item = ItemStack::from_name("minecraft:oak_boat", 1).unwrap();
+    let boat_type_id =
+        mc_data::static_registry_protocol_id("minecraft:entity_type", "minecraft:oak_boat")
+            .unwrap();
+    let arrow_type_id =
+        mc_data::static_registry_protocol_id("minecraft:entity_type", "minecraft:arrow").unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &boat_item))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(19, -61, 10),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 1.0,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        133,
+    ))
+    .await
+    .unwrap();
+
+    let mut got_dispenser_arrow = false;
+    let mut got_respawn_set_chat = false;
+    let mut got_sleeping_bar = false;
+    let mut boat_eid = None;
+    for _ in 0..450 {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(4), c1.read_raw_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::ADD_ENTITY {
+            let eid = r.read_varint().unwrap();
+            let _uuid = r.read_uuid().unwrap();
+            let etype = r.read_varint().unwrap();
+            if etype == arrow_type_id {
+                got_dispenser_arrow = true;
+            } else if etype == boat_type_id {
+                boat_eid = Some(eid);
+            }
+        } else if pid == packet_ids::play::clientbound::SYSTEM_CHAT {
+            if let Ok(mc_nbt::NbtTag::String(s)) = r.read_nbt_network() {
+                if s.contains("Respawn point set") {
+                    got_respawn_set_chat = true;
+                }
+            }
+        } else if pid == packet_ids::play::clientbound::SET_ACTION_BAR_TEXT {
+            if let Ok(mc_nbt::NbtTag::String(s)) = r.read_nbt_network() {
+                if s.contains("players sleeping") {
+                    got_sleeping_bar = true;
+                }
+            }
+        }
+        if got_dispenser_arrow && got_respawn_set_chat && got_sleeping_bar && boat_eid.is_some() {
+            break;
+        }
+    }
+    assert!(got_dispenser_arrow, "Expected Dispenser to fire an Arrow entity!");
+    assert!(got_respawn_set_chat, "Expected Bed right-click to set respawn point!");
+    assert!(got_sleeping_bar, "Expected Night Bed right-click to report players sleeping!");
+    let beid = boat_eid.expect("Expected Oak Boat AddEntity!");
+
+    // Mount boat, dismount boat, teleport far to verify ForgetLevelChunk, and /save-all to verify entities/r.0.0.mca!
+    c1.write_raw_packet(&encode_serverbound_interact(
+        beid,
+        InteractionHand::MainHand,
+        Vec3::ZERO,
+        false,
+    ))
+    .await
+    .unwrap();
+    c1.write_raw_packet(&encode_serverbound_player_input(player_input_flags::SHIFT))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("save-all"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("tp 240 -60 240"))
+        .await
+        .unwrap();
+
+    let mut got_mounted = false;
+    let mut got_dismounted = false;
+    let mut got_forget_chunk = false;
+    for _ in 0..350 {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(4), c1.read_raw_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::SET_PASSENGERS {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:set_passengers");
+            assert_eq!(reenc, raw);
+            let vid = r.read_varint().unwrap();
+            let cnt = r.read_varint().unwrap();
+            if vid == beid {
+                if cnt == 1 {
+                    got_mounted = true;
+                } else if cnt == 0 {
+                    got_dismounted = true;
+                }
+            }
+        } else if pid == packet_ids::play::clientbound::FORGET_LEVEL_CHUNK {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:forget_level_chunk");
+            assert_eq!(reenc, raw);
+            got_forget_chunk = true;
+        }
+        if got_mounted && got_dismounted && got_forget_chunk {
+            break;
+        }
+    }
+    assert!(got_mounted, "Expected oracle-verified SetPassengers([Alice]) mounting Oak Boat");
+    assert!(got_dismounted, "Expected oracle-verified SetPassengers([]) dismounting Oak Boat");
+    assert!(got_forget_chunk, "Expected oracle-verified ForgetLevelChunk when teleporting far");
+    assert!(
+        e2e_world.join("entities").join("r.0.0.mca").is_file(),
+        "Expected Minecraft 26.3 entities/r.0.0.mca to be saved on /save-all!"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = server_task.await;

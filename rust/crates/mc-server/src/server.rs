@@ -5,16 +5,24 @@ use crate::commands::{self, CommandAction};
 use crate::config::ServerConfig;
 use crate::extra_commands::{BossBarProperty, ExtraCommandAction, FillMode, TitleSlot, parse_extra_command};
 use crate::jsonrpc::JsonRpcServer;
+use crate::live_entities::{
+    LiveEntityManager, MobInteractOutcome, plan_natural_spawns, vehicle_kind_from_item,
+};
 use crate::playerdata::{SavedPlayerData, add_experience_points, load_player_data, save_player_data};
 use crate::query::{QueryServer, QuerySnapshot};
 use crate::rcon::RconServer;
 use crate::scoreboard::ScoreboardStore;
+use crate::workstation_menus::{
+    WorkstationMenu, brewing_handle_click, brewing_open_packets, brewing_sync_packets,
+    count_bookshelves_around,
+};
 use crate::world_loader::{DimensionId, WorldStore};
 use anyhow::Result;
 use mc_data::block_behaviors::{
-    KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_CRAFTING_TABLE, KIND_END_PORTAL,
-    KIND_FURNACE, KIND_HOPPER, KIND_NETHER_PORTAL, KIND_SIGN, KIND_SMOKER, block_behavior,
-    resolve_placement,
+    KIND_ANVIL, KIND_BARREL, KIND_BED, KIND_BLAST_FURNACE, KIND_BREWING_STAND, KIND_CHEST,
+    KIND_CRAFTING_TABLE, KIND_DISPENSER, KIND_DROPPER, KIND_ENCHANTING_TABLE, KIND_END_PORTAL,
+    KIND_FURNACE, KIND_HOPPER, KIND_NETHER_PORTAL, KIND_SIGN, KIND_SMITHING_TABLE, KIND_SMOKER,
+    KIND_STONECUTTER, block_behavior, resolve_placement,
 };
 use mc_data::block_extra::{FIRE_STATE_ID, is_tnt};
 use mc_data::gameplay_tables::enchantment_by_id;
@@ -32,38 +40,41 @@ use mc_proto::{
     InteractionHand, KnownPack, LoginServerbound, ObjectiveMethod, ObjectiveRenderType,
     PackedRegistryEntry, PlayExtraServerbound, PlayLoginPacket, PlayRespawnPacket, PlayServerbound,
     PlayerActionType, PlayerTeamParams, StatusServerbound, SwingAnimationType, TeamCollisionRule,
-    TeamColor, TeamVisibility, encode_config_custom_payload_brand, encode_config_finish,
-    encode_config_registry_data, encode_config_select_known_packs, encode_config_update_tags_raw,
-    encode_login_compression, encode_login_disconnect, encode_login_finished, encode_login_hello,
-    encode_play_add_entity, encode_play_block_changed_ack, encode_play_block_entity_data,
-    encode_play_block_update, encode_play_boss_event_add, encode_play_boss_event_remove,
-    encode_play_boss_event_update_name, encode_play_boss_event_update_progress,
-    encode_play_boss_event_update_style, encode_play_change_difficulty,
-    encode_play_chunk_batch_finished, encode_play_chunk_batch_start, encode_play_clear_titles,
-    encode_play_container_close, encode_play_container_set_content,
+    TeamColor, TeamVisibility, animate_action, encode_config_custom_payload_brand,
+    encode_config_finish, encode_config_registry_data, encode_config_select_known_packs,
+    encode_config_update_tags_raw, encode_login_compression, encode_login_disconnect,
+    encode_login_finished, encode_login_hello, encode_play_add_entity, encode_play_animate,
+    encode_play_block_changed_ack, encode_play_block_entity_data, encode_play_block_update,
+    encode_play_boss_event_add, encode_play_boss_event_remove, encode_play_boss_event_update_name,
+    encode_play_boss_event_update_progress, encode_play_boss_event_update_style,
+    encode_play_change_difficulty, encode_play_chunk_batch_finished, encode_play_chunk_batch_start,
+    encode_play_clear_titles, encode_play_container_close, encode_play_container_set_content,
     encode_play_container_set_data, encode_play_container_set_slot, encode_play_disconnect,
     encode_play_entity_event, encode_play_entity_position_sync, encode_play_explode,
-    encode_play_game_event, encode_play_hurt_animation, encode_play_keep_alive,
-    encode_play_level_chunk_with_light, encode_play_level_event, encode_play_light_update,
-    encode_play_open_screen, encode_play_open_sign_editor, encode_play_player_abilities,
-    encode_play_player_info_add, encode_play_player_info_remove, encode_play_player_position,
-    encode_play_remove_entities, encode_play_remove_mob_effect, encode_play_reset_score,
-    encode_play_set_action_bar_text, encode_play_set_chunk_cache_center,
+    encode_play_forget_level_chunk, encode_play_game_event, encode_play_hurt_animation,
+    encode_play_keep_alive, encode_play_level_chunk_with_light, encode_play_level_event,
+    encode_play_light_update, encode_play_open_screen, encode_play_open_sign_editor,
+    encode_play_player_abilities, encode_play_player_info_add, encode_play_player_info_remove,
+    encode_play_player_position, encode_play_remove_entities, encode_play_remove_mob_effect,
+    encode_play_reset_score, encode_play_set_action_bar_text, encode_play_set_chunk_cache_center,
     encode_play_set_default_spawn, encode_play_set_display_objective, encode_play_set_entity_data,
     encode_play_set_entity_motion, encode_play_set_equipment, encode_play_set_experience,
     encode_play_set_health, encode_play_set_held_slot, encode_play_set_objective,
-    encode_play_set_player_team_create, encode_play_set_player_team_join,
-    encode_play_set_player_team_leave, encode_play_set_player_team_remove, encode_play_set_score,
-    encode_play_set_subtitle_text, encode_play_set_time, encode_play_set_title_text,
-    encode_play_set_titles_animation, encode_play_swing_animation, encode_play_system_chat,
-    encode_play_take_item_entity, encode_play_update_mob_effect, encode_status_pong,
-    encode_status_response, offline_player_uuid, text_component,
+    encode_play_set_passengers, encode_play_set_player_team_create,
+    encode_play_set_player_team_join, encode_play_set_player_team_leave,
+    encode_play_set_player_team_remove, encode_play_set_score, encode_play_set_subtitle_text,
+    encode_play_set_time, encode_play_set_title_text, encode_play_set_titles_animation,
+    encode_play_swing_animation, encode_play_system_chat, encode_play_take_item_entity,
+    encode_play_update_mob_effect, encode_status_pong, encode_status_response, offline_player_uuid,
+    player_input_flags, text_component,
 };
 use mc_world::{
-    Arena, BlockEntityKind, ContainerClickType, DirtyLightSections, EntityKind, EntityTickOutcome,
-    Handle, ItemStack, PlayerInventory, StructureRotation, StructureTemplate, TickScheduler,
-    WorldEntity, apply_container_click, compute_and_apply_explosion,
-    compute_entity_explosion_knockback, execute_scheduled_tick, interact_block,
+    Arena, BED_EXPLOSION_POWER, BedInteractResult, BlockEntityKind, ChunkTicketManager,
+    ContainerClickType, DirtyLightSections, DispenserAction, EntityKind, EntityTickOutcome, Handle,
+    ItemStack, PlayerInventory, ScheduledTickKind, SleepManager, StructureRotation,
+    StructureTemplate, TickScheduler, WorldEntity, apply_container_click,
+    compute_and_apply_explosion, compute_entity_explosion_knockback, dispense_from_slots,
+    dispenser_facing, execute_scheduled_tick, facing_offset, interact_block, is_container_block,
     propagate_neighbor_updates, run_chunk_random_ticks, trigger_pressure_plate,
     try_ignite_nether_portal,
 };
@@ -84,7 +95,9 @@ enum OpenMenu {
     Barrel { container_id: i32, pos: BlockPos },
     Furnace { container_id: i32, pos: BlockPos },
     Hopper { container_id: i32, pos: BlockPos },
+    Dispenser { container_id: i32, pos: BlockPos },
     CraftingTable { container_id: i32, slots: Vec<ItemStack> },
+    Workstation(WorkstationMenu),
 }
 
 impl OpenMenu {
@@ -94,7 +107,9 @@ impl OpenMenu {
             | Self::Barrel { container_id, .. }
             | Self::Furnace { container_id, .. }
             | Self::Hopper { container_id, .. }
+            | Self::Dispenser { container_id, .. }
             | Self::CraftingTable { container_id, .. } => *container_id,
+            Self::Workstation(ws) => ws.container_id(),
         }
     }
 
@@ -103,8 +118,10 @@ impl OpenMenu {
             Self::Chest { pos, .. }
             | Self::Barrel { pos, .. }
             | Self::Furnace { pos, .. }
-            | Self::Hopper { pos, .. } => Some(*pos),
+            | Self::Hopper { pos, .. }
+            | Self::Dispenser { pos, .. } => Some(*pos),
             Self::CraftingTable { .. } => None,
+            Self::Workstation(ws) => ws.block_pos(),
         }
     }
 }
@@ -134,6 +151,7 @@ struct PlayerEntity {
     xp_level: i32,
     xp_progress: f32,
     xp_total: i32,
+    enchantment_seed: i32,
     portal_cooldown: u32,
     effects: Vec<ActiveEffect>,
     advancements: PlayerAdvancements,
@@ -477,6 +495,10 @@ struct SimState {
     scoreboard: ScoreboardStore,
     players: Arena<PlayerEntity>,
     entities: Arena<WorldEntity>,
+    live_entities: LiveEntityManager,
+    sleep_manager: SleepManager,
+    overworld_tickets: ChunkTicketManager,
+    loaded_entity_chunks: HashSet<ChunkPos>,
     scheduler: TickScheduler,
     next_entity_id: i32,
     overworld_dim_id: i32,
@@ -494,6 +516,47 @@ impl SimState {
             }
             if let Err(e) = p.advancements.save(dir) {
                 warn!("Failed saving advancements for {}: {e}", p.profile.name);
+            }
+        }
+        self.save_all_entities();
+    }
+
+    fn save_all_entities(&self) {
+        let store = self.world.entity_store(DimensionId::Overworld);
+        let mut by_chunk: std::collections::HashMap<ChunkPos, Vec<&WorldEntity>> =
+            std::collections::HashMap::new();
+        for (_, ent) in self.entities.iter() {
+            let cp = ChunkPos::new(
+                (ent.pos.x.floor() as i32) >> 4,
+                (ent.pos.z.floor() as i32) >> 4,
+            );
+            by_chunk.entry(cp).or_default().push(ent);
+        }
+        for (cp, list) in by_chunk {
+            if let Err(e) = store.save_chunk_entities(cp, &list) {
+                warn!("Failed saving entities for chunk ({}, {}): {e}", cp.x, cp.z);
+            }
+        }
+    }
+
+    fn load_entities_for_chunks(&mut self, chunks: &[ChunkPos]) {
+        let store = self.world.entity_store(DimensionId::Overworld);
+        for &cp in chunks {
+            if !self.loaded_entity_chunks.insert(cp) {
+                continue;
+            }
+            let mut next_id = || {
+                let id = self.next_entity_id;
+                self.next_entity_id += 1;
+                id
+            };
+            match store.load_chunk_entities(cp, &mut next_id) {
+                Ok(loaded) => {
+                    for ent in loaded {
+                        self.spawn_world_entity(ent);
+                    }
+                }
+                Err(e) => warn!("Failed loading entities for chunk ({}, {}): {e}", cp.x, cp.z),
             }
         }
     }
@@ -1287,7 +1350,12 @@ impl SimState {
         let due = self.scheduler.drain_due(now);
         let mut all_block_changes = Vec::new();
         let mut falling_spawns = Vec::new();
+        let mut dispenser_fires = Vec::new();
         for tick in due {
+            if tick.kind == ScheduledTickKind::DispenserFire {
+                dispenser_fires.push(tick.pos);
+                continue;
+            }
             let (changes, falling) =
                 execute_scheduled_tick(&mut self.world, &mut self.scheduler, now, tick);
             all_block_changes.extend(changes);
@@ -1296,6 +1364,9 @@ impl SimState {
             }
         }
         self.broadcast_block_changes(&all_block_changes);
+        for dpos in dispenser_fires {
+            self.execute_dispenser_fire(dpos, now);
+        }
         for (pos, state) in falling_spawns {
             let eid = self.alloc_entity_id();
             let ent = WorldEntity::spawn_falling_block(eid, pos, state);
@@ -1483,7 +1554,11 @@ impl SimState {
                             tp_pos.z.floor() as i32,
                         );
                         let _ = p.tx.send(encode_play_level_event(2003, bp, 0, false));
-                        stream_chunks_for_player(p, &mut self.world);
+                        let newly_loaded = stream_chunks_for_player(
+                            p,
+                            &mut self.world,
+                            &mut self.overworld_tickets,
+                        );
                         sync_pkt = Some(encode_play_entity_position_sync(
                             p.entity_id,
                             p.pos,
@@ -1491,6 +1566,7 @@ impl SimState {
                             p.pitch,
                             true,
                         ));
+                        let _ = newly_loaded;
                     }
                     if let Some(sp) = sync_pkt {
                         for (ph, other) in self.players.iter() {
@@ -1575,10 +1651,29 @@ impl SimState {
         }
         self.broadcast_block_changes(&lit_changes);
 
-        // 5. Tick all loaded hoppers and sync modified container viewers
+        // 5. Tick all loaded hoppers & brewing stands and sync modified container viewers
         let hopper_modified = self.world.tick_hoppers();
         for pos in hopper_modified {
             self.sync_open_block_container(pos);
+        }
+
+        let brew_updates = self.world.tick_brewing_stands();
+        for (pos, brew_time, fuel, slots_changed) in brew_updates {
+            for (_, p) in self.players.iter() {
+                if let Some(OpenMenu::Workstation(WorkstationMenu::BrewingStand {
+                    container_id,
+                    pos: bpos,
+                })) = &p.open_menu
+                {
+                    if *bpos == pos {
+                        let _ = p.tx.send(encode_play_container_set_data(*container_id, 0, brew_time));
+                        let _ = p.tx.send(encode_play_container_set_data(*container_id, 1, fuel as i16));
+                    }
+                }
+            }
+            if slots_changed {
+                self.sync_open_block_container(pos);
+            }
         }
 
         // 6. Tick vanilla FoodData (exhaustion, natural regen, starvation) for survival players
@@ -1701,65 +1796,245 @@ impl SimState {
             self.damage_player(ph, dmg, reason);
         }
 
-        // 7. Hostile mob chasing & melee combat (every 10 ticks)
-        if now % 10 == 0 {
-            let survival_players: Vec<(PlayerHandle, Vec3)> = self
+        // 7. Full Live Mob AI (Creeper fuse/explode, Skeleton ranged arrows, Zombie sun-burn,
+        //    Enderman teleport, hostile melee, breeding pairs) + Natural Mob Spawner + SleepManager
+        let overworld_players_count = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.dimension == DimensionId::Overworld)
+            .count();
+        let sleep_pct = self.world.gamerules.players_sleeping_percentage();
+        let sleep_res = self.sleep_manager.tick(
+            overworld_players_count,
+            sleep_pct,
+            self.world.day_time,
+            self.world.raining,
+            self.world.thundering,
+        );
+        if sleep_res.skip_night {
+            if let Some(new_dt) = sleep_res.new_day_time {
+                self.world.day_time = new_dt;
+                let tpkt = encode_play_set_time(
+                    self.world.game_time,
+                    &[(self.overworld_clock_id, self.world.day_time, 0.0, 1.0)],
+                );
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(tpkt.clone());
+                }
+            }
+            if sleep_res.clear_weather {
+                self.apply_weather(false, false, 24000);
+            }
+            if let Ok(gm_pkt) = encode_play_system_chat("Sleeping through this night", false) {
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(gm_pkt.clone());
+                }
+            }
+        }
+        for woke_eid in sleep_res.woke_players {
+            let wake_pkt = encode_play_animate(woke_eid, animate_action::WAKE_UP);
+            for (_, p) in self.players.iter() {
+                let _ = p.tx.send(wake_pkt.clone());
+            }
+        }
+
+        // Step live mob AI for all loaded entities
+        let survival_player_targets: Vec<(i32, Vec3)> = self
+            .players
+            .iter()
+            .filter_map(|(_, p)| {
+                if !p.dead && p.gamemode == 0 && p.dimension == DimensionId::Overworld {
+                    Some((p.entity_id, p.pos))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let is_daytime = (self.world.day_time.rem_euclid(24000)) < 12542 && !self.world.raining;
+        let entity_handles: Vec<Handle<WorldEntity>> = self.entities.iter().map(|(h, _)| h).collect();
+        let mut entity_buf: Vec<WorldEntity> = entity_handles
+            .iter()
+            .filter_map(|&h| self.entities.get(h).cloned())
+            .collect();
+        let world_ref = &self.world;
+        let ai_out = self.live_entities.step_all_mobs(
+            &mut entity_buf,
+            &survival_player_targets,
+            is_daytime,
+            |pos| {
+                world_ref.is_sky_exposed(BlockPos::new(
+                    pos.x.floor() as i32,
+                    (pos.y + 1.0).floor() as i32,
+                    pos.z.floor() as i32,
+                ))
+            },
+            now,
+        );
+        for (h, updated) in entity_handles.into_iter().zip(entity_buf.into_iter()) {
+            if let Some(slot) = self.entities.get_mut(h) {
+                *slot = updated;
+            }
+        }
+
+        for (target_eid, dmg) in ai_out.melee_attacks {
+            let ph_opt = self
                 .players
                 .iter()
-                .filter_map(|(ph, p)| {
-                    if !p.dead && p.gamemode == 0 {
-                        Some((ph, p.pos))
+                .find_map(|(h, p)| if p.entity_id == target_eid { Some(h) } else { None });
+            if let Some(ph) = ph_opt {
+                self.damage_player(ph, dmg, "was slain by a mob");
+            }
+        }
+        for (shooter_eid, origin, target) in ai_out.arrows_to_spawn {
+            let dx = target.x - origin.x;
+            let dy = target.y - origin.y;
+            let dz = target.z - origin.z;
+            let hdist = (dx * dx + dz * dz).sqrt().max(0.001);
+            let yaw = (-dx).atan2(dz).to_degrees() as f32;
+            let pitch = (-dy.atan2(hdist)).to_degrees() as f32;
+            let eid = self.alloc_entity_id();
+            if let Some(arrow) = WorldEntity::spawn_projectile(
+                eid,
+                "minecraft:arrow",
+                shooter_eid,
+                origin,
+                yaw,
+                pitch,
+                1.6,
+                4.0,
+            ) {
+                self.spawn_world_entity(arrow);
+            }
+        }
+        for (creeper_eid, pos, power) in ai_out.creeper_explosions {
+            let ch_opt = self
+                .entities
+                .iter()
+                .find_map(|(h, e)| if e.entity_id == creeper_eid { Some(h) } else { None });
+            if let Some(ch) = ch_opt {
+                self.entities.remove(ch);
+                self.live_entities.remove_entity(creeper_eid);
+                let rm = encode_play_remove_entities(&[creeper_eid]);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(rm.clone());
+                }
+            }
+            let grief = self.world.gamerules.mob_griefing();
+            if grief {
+                self.trigger_explosion(pos, power, false);
+            }
+        }
+        for (mob_eid, dmg) in ai_out.sun_burn_mobs {
+            let mh_opt = self
+                .entities
+                .iter()
+                .find_map(|(h, e)| if e.entity_id == mob_eid { Some(h) } else { None });
+            if let Some(mh) = mh_opt {
+                let mut died = false;
+                if let Some(ent) = self.entities.get_mut(mh) {
+                    if let EntityKind::Mob { ref mut health, .. } = ent.kind {
+                        *health = (*health - dmg).max(0.0);
+                        died = *health <= 0.0;
+                    }
+                }
+                if died {
+                    self.entities.remove(mh);
+                    self.live_entities.remove_entity(mob_eid);
+                    let rm = encode_play_remove_entities(&[mob_eid]);
+                    for (_, p) in self.players.iter() {
+                        let _ = p.tx.send(rm.clone());
+                    }
+                }
+            }
+        }
+        for (baby_type, pos) in ai_out.babies_to_spawn {
+            let eid = self.alloc_entity_id();
+            if let Some(baby) = WorldEntity::spawn_mob(eid, &baby_type, pos) {
+                self.live_entities.ensure_mob_ai(eid, &baby_type, now).is_baby = true;
+                self.spawn_world_entity(baby);
+            }
+        }
+        for (mob_eid, new_pos) in ai_out.teleported_mobs {
+            let sp = encode_play_entity_position_sync(mob_eid, new_pos, 0.0, 0.0, true);
+            for (_, p) in self.players.iter() {
+                let _ = p.tx.send(sp.clone());
+            }
+        }
+
+        // 7b. Natural mob spawning every 200 ticks when enabled
+        if now > 0 && now % 200 == 0 && self.world.gamerules.do_mob_spawning() && !self.players.is_empty() {
+            let player_positions: Vec<Vec3> = self
+                .players
+                .iter()
+                .filter_map(|(_, p)| {
+                    if p.dimension == DimensionId::Overworld {
+                        Some(p.pos)
                     } else {
                         None
                     }
                 })
                 .collect();
-            if !survival_players.is_empty() {
-                let mut mob_hits: Vec<(PlayerHandle, String)> = Vec::new();
-                for (_, ent) in self.entities.iter_mut() {
-                    if let EntityKind::Mob {
-                        ref type_name,
-                        ref mut wander_dir,
-                        ..
-                    } = ent.kind
-                    {
-                        let hostile = matches!(
-                            type_name.as_str(),
-                            "minecraft:zombie"
-                                | "minecraft:skeleton"
-                                | "minecraft:spider"
-                                | "minecraft:creeper"
-                                | "minecraft:husk"
-                                | "minecraft:drowned"
-                                | "minecraft:stray"
-                                | "minecraft:wither_skeleton"
+            let existing: Vec<WorldEntity> = self.entities.iter().map(|(_, e)| e.clone()).collect();
+            let is_night = (self.world.day_time.rem_euclid(24000)) >= 12542;
+            let is_peaceful = self.world.difficulty == 0;
+            let planned = plan_natural_spawns(
+                &player_positions,
+                &existing,
+                is_night,
+                is_peaceful,
+                |x, y, z| self.world.biome_name_at(x, y, z),
+                |x, z| self.world.surface_y_in_loaded_chunk(x, z),
+                now,
+            );
+            for (mtype, spos) in planned.into_iter().take(4) {
+                let eid = self.alloc_entity_id();
+                if let Some(mob) = WorldEntity::spawn_mob(eid, &mtype, spos) {
+                    self.spawn_world_entity(mob);
+                }
+            }
+        }
+
+        // 7c. Chunk ticket expiration -> save entities to .mca & unload distant Overworld chunks
+        let expired_chunks = self.overworld_tickets.tick();
+        if !expired_chunks.is_empty() {
+            let ent_store = self.world.entity_store(DimensionId::Overworld);
+            for cp in expired_chunks {
+                let in_chunk: Vec<(Handle<WorldEntity>, i32)> = self
+                    .entities
+                    .iter()
+                    .filter_map(|(h, e)| {
+                        let ecp = ChunkPos::new(
+                            (e.pos.x.floor() as i32) >> 4,
+                            (e.pos.z.floor() as i32) >> 4,
                         );
-                        if !hostile {
-                            continue;
+                        if ecp == cp { Some((h, e.entity_id)) } else { None }
+                    })
+                    .collect();
+                if !in_chunk.is_empty() {
+                    let refs: Vec<&WorldEntity> = in_chunk
+                        .iter()
+                        .filter_map(|(h, _)| self.entities.get(*h))
+                        .collect();
+                    if let Err(e) = ent_store.save_chunk_entities(cp, &refs) {
+                        warn!("Failed saving entities during unload of ({}, {}): {e}", cp.x, cp.z);
+                    }
+                    let mut removed_ids = Vec::with_capacity(in_chunk.len());
+                    for (h, eid) in in_chunk {
+                        if self.entities.remove(h).is_some() {
+                            self.live_entities.remove_entity(eid);
+                            removed_ids.push(eid);
                         }
-                        let mut closest: Option<(PlayerHandle, Vec3, f64)> = None;
-                        for &(ph, ppos) in &survival_players {
-                            let d2 = (ppos.x - ent.pos.x).powi(2)
-                                + (ppos.y - ent.pos.y).powi(2)
-                                + (ppos.z - ent.pos.z).powi(2);
-                            if d2 < 256.0 && closest.map(|c| d2 < c.2).unwrap_or(true) {
-                                closest = Some((ph, ppos, d2));
-                            }
-                        }
-                        if let Some((ph, ppos, d2)) = closest {
-                            let dx = ppos.x - ent.pos.x;
-                            let dz = ppos.z - ent.pos.z;
-                            let hdist = (dx * dx + dz * dz).sqrt().max(0.001);
-                            *wander_dir = (dx / hdist, dz / hdist);
-                            if d2 <= 3.24 && now % 20 == 0 {
-                                mob_hits.push((ph, type_name.clone()));
-                            }
+                    }
+                    if !removed_ids.is_empty() {
+                        let rm = encode_play_remove_entities(&removed_ids);
+                        for (_, p) in self.players.iter() {
+                            let _ = p.tx.send(rm.clone());
                         }
                     }
                 }
-                for (ph, mname) in mob_hits {
-                    let short = mname.strip_prefix("minecraft:").unwrap_or(&mname);
-                    self.damage_player(ph, 3.0, &format!("was slain by {short}"));
+                self.loaded_entity_chunks.remove(&cp);
+                if let Err(e) = self.world.unload_chunk(DimensionId::Overworld, cp) {
+                    warn!("Failed unloading chunk ({}, {}): {e}", cp.x, cp.z);
                 }
             }
         }
@@ -1855,11 +2130,17 @@ impl SimState {
             OpenMenu::Chest { pos, .. }
             | OpenMenu::Barrel { pos, .. }
             | OpenMenu::Furnace { pos, .. }
-            | OpenMenu::Hopper { pos, .. } => {
+            | OpenMenu::Hopper { pos, .. }
+            | OpenMenu::Dispenser { pos, .. } => {
                 let be = self.world.get_block_entity(*pos)?;
                 be.items_slice()?.to_vec()
             }
             OpenMenu::CraftingTable { slots, .. } => slots.clone(),
+            OpenMenu::Workstation(WorkstationMenu::BrewingStand { pos, .. }) => {
+                let be = self.world.get_block_entity(*pos)?;
+                be.items_slice()?.to_vec()
+            }
+            OpenMenu::Workstation(_) => return None,
         };
         // Append player main inventory (9..36) + hotbar (36..45)
         out.extend_from_slice(&p.inventory.slots[9..45]);
@@ -1882,6 +2163,22 @@ impl SimState {
         for (vh, cid) in viewers {
             let menu_opt = self.players.get(vh).and_then(|p| p.open_menu.clone());
             if let Some(menu) = menu_opt {
+                if matches!(menu, OpenMenu::Workstation(WorkstationMenu::BrewingStand { .. })) {
+                    let bstate = self.world.get_block_entity(pos).and_then(|be| {
+                        if let BlockEntityKind::BrewingStand { ref state } = be.kind {
+                            Some(state.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let (Some(st), Some(p)) = (bstate, self.players.get_mut(vh)) {
+                        p.inventory.next_state_id();
+                        for pkt in brewing_sync_packets(&st, cid, &p.inventory) {
+                            let _ = p.tx.send(pkt);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(slots) = self
                     .players
                     .get(vh)
@@ -1904,6 +2201,60 @@ impl SimState {
     fn open_block_menu(&mut self, handle: PlayerHandle, pos: BlockPos) -> bool {
         let st = self.world.get_block(pos);
         let kind = block_behavior(st.0).kind;
+
+        // Interactive workstations handled by WorkstationMenu
+        if matches!(
+            kind,
+            KIND_BREWING_STAND
+                | KIND_ENCHANTING_TABLE
+                | KIND_ANVIL
+                | KIND_SMITHING_TABLE
+                | KIND_STONECUTTER
+        ) {
+            let bstate = if kind == KIND_BREWING_STAND {
+                let Some(be) = self.world.ensure_block_entity(pos) else {
+                    return false;
+                };
+                if let BlockEntityKind::BrewingStand { ref state } = be.kind {
+                    Some(state.clone())
+                } else {
+                    return false;
+                }
+            } else {
+                None
+            };
+            let bookshelves = if kind == KIND_ENCHANTING_TABLE {
+                count_bookshelves_around(&mut self.world, pos)
+            } else {
+                0
+            };
+            let Some(p) = self.players.get_mut(handle) else {
+                return false;
+            };
+            let cid = p.next_container_id;
+            p.next_container_id = (p.next_container_id % 100) + 1;
+            let ws = match kind {
+                KIND_BREWING_STAND => WorkstationMenu::new_brewing_stand(cid, pos),
+                KIND_ENCHANTING_TABLE => {
+                    WorkstationMenu::new_enchanting(cid, pos, p.enchantment_seed, bookshelves)
+                }
+                KIND_ANVIL => WorkstationMenu::new_anvil(cid, pos),
+                KIND_SMITHING_TABLE => WorkstationMenu::new_smithing(cid),
+                _ => WorkstationMenu::new_stonecutter(cid),
+            };
+            p.inventory.next_state_id();
+            let packets = if let Some(ref st) = bstate {
+                brewing_open_packets(st, cid, &p.inventory)
+            } else {
+                ws.open_packets(&p.inventory)
+            };
+            p.open_menu = Some(OpenMenu::Workstation(ws));
+            for pkt in packets {
+                let _ = p.tx.send(pkt);
+            }
+            return true;
+        }
+
         let (menu_type, title, is_be) = match kind {
             KIND_CHEST => (menu_types::GENERIC_9X3, "Chest", true),
             KIND_BARREL => (menu_types::GENERIC_9X3, "Barrel", true),
@@ -1911,6 +2262,8 @@ impl SimState {
             KIND_BLAST_FURNACE => (menu_types::BLAST_FURNACE, "Blast Furnace", true),
             KIND_SMOKER => (menu_types::SMOKER, "Smoker", true),
             KIND_HOPPER => (menu_types::HOPPER, "Item Hopper", true),
+            KIND_DISPENSER => (menu_types::GENERIC_3X3, "Dispenser", true),
+            KIND_DROPPER => (menu_types::GENERIC_3X3, "Dropper", true),
             KIND_CRAFTING_TABLE => (menu_types::CRAFTING, "Crafting", false),
             _ => return false,
         };
@@ -1952,6 +2305,10 @@ impl SimState {
                     pos,
                 },
                 KIND_HOPPER => OpenMenu::Hopper {
+                    container_id: id,
+                    pos,
+                },
+                KIND_DISPENSER | KIND_DROPPER => OpenMenu::Dispenser {
                     container_id: id,
                     pos,
                 },
@@ -2039,13 +2396,104 @@ impl SimState {
             let menu_opt = self.players.get(handle).and_then(|p| p.open_menu.clone());
             if let Some(mut menu) = menu_opt {
                 if menu.container_id() == container_id {
+                    // Handle WorkstationMenu variants (BrewingStand, Enchanting, Anvil, Smithing, Stonecutter, Merchant)
+                    if let OpenMenu::Workstation(ws) = &mut menu {
+                        let mut extra_drops: Vec<(Vec3, Vec3, ItemStack)> = Vec::new();
+                        let mut sync_pos: Option<BlockPos> = None;
+                        let mut trade_villager: Option<i32> = None;
+
+                        if let WorkstationMenu::BrewingStand { pos, .. } = ws {
+                            let bp = *pos;
+                            if let (Some(be), Some(p)) =
+                                (self.world.get_block_entity_mut(bp), self.players.get_mut(handle))
+                            {
+                                if let BlockEntityKind::BrewingStand { ref mut state } = be.kind {
+                                    let is_creative = p.gamemode == 1;
+                                    let out = brewing_handle_click(
+                                        state,
+                                        container_id,
+                                        &mut p.inventory,
+                                        slot_num,
+                                        button_num,
+                                        click_type,
+                                        is_creative,
+                                    );
+                                    for pkt in out.packets {
+                                        let _ = p.tx.send(pkt);
+                                    }
+                                    let yaw_rad = (p.yaw as f64).to_radians();
+                                    for item in out.dropped_items {
+                                        extra_drops.push((
+                                            Vec3::new(p.pos.x, p.pos.y + 1.3, p.pos.z),
+                                            Vec3::new(-yaw_rad.sin() * 0.3, 0.2, yaw_rad.cos() * 0.3),
+                                            item,
+                                        ));
+                                    }
+                                    sync_pos = Some(bp);
+                                }
+                            }
+                        } else if let Some(p) = self.players.get_mut(handle) {
+                            let is_creative = p.gamemode == 1;
+                            let out = ws.handle_click(
+                                &mut p.inventory,
+                                slot_num,
+                                button_num,
+                                click_type,
+                                p.xp_level,
+                                is_creative,
+                            );
+                            if out.xp_level_delta != 0 {
+                                p.xp_level = (p.xp_level + out.xp_level_delta).max(0);
+                                let _ = p.tx.send(encode_play_set_experience(
+                                    p.xp_progress,
+                                    p.xp_level,
+                                    p.xp_total,
+                                ));
+                            }
+                            if let Some(seed) = out.new_enchant_seed {
+                                p.enchantment_seed = seed;
+                            }
+                            if out.completed_trade {
+                                if let WorkstationMenu::Merchant { villager_eid, .. } = ws {
+                                    trade_villager = Some(*villager_eid);
+                                }
+                            }
+                            let yaw_rad = (p.yaw as f64).to_radians();
+                            for item in out.dropped_items {
+                                extra_drops.push((
+                                    Vec3::new(p.pos.x, p.pos.y + 1.3, p.pos.z),
+                                    Vec3::new(-yaw_rad.sin() * 0.3, 0.2, yaw_rad.cos() * 0.3),
+                                    item,
+                                ));
+                            }
+                            for pkt in out.packets {
+                                let _ = p.tx.send(pkt);
+                            }
+                            p.open_menu = Some(menu);
+                        }
+
+                        if let Some(veid) = trade_villager {
+                            self.live_entities.add_villager_xp(veid, 5);
+                        }
+                        if let Some(bp) = sync_pos {
+                            self.sync_open_block_container(bp);
+                        }
+                        for (pos, vel, stack) in extra_drops {
+                            let eid = self.alloc_entity_id();
+                            self.spawn_world_entity(WorldEntity::spawn_item(eid, pos, vel, stack, 40));
+                        }
+                        return;
+                    }
+
                     let (top_count, crafting_grid, hotbar_start, block_pos) = match &menu {
                         OpenMenu::Chest { pos, .. } | OpenMenu::Barrel { pos, .. } => {
                             (27, None, 54, Some(*pos))
                         }
                         OpenMenu::Furnace { pos, .. } => (3, None, 30, Some(*pos)),
                         OpenMenu::Hopper { pos, .. } => (5, None, 32, Some(*pos)),
+                        OpenMenu::Dispenser { pos, .. } => (9, None, 36, Some(*pos)),
                         OpenMenu::CraftingTable { .. } => (10, Some((3, 3)), 37, None),
+                        OpenMenu::Workstation(_) => unreachable!(),
                     };
                     if let Some(mut flat) = self
                         .players
@@ -2135,12 +2583,18 @@ impl SimState {
                 }
                 p.inventory.slots[0] = ItemStack::EMPTY;
             } else if let Some(menu) = p.open_menu.take() {
-                if let OpenMenu::CraftingTable { slots, .. } = menu {
-                    for item in slots.into_iter().skip(1) {
-                        if !item.is_empty() {
-                            to_return.push(item);
+                match menu {
+                    OpenMenu::CraftingTable { slots, .. } => {
+                        for item in slots.into_iter().skip(1) {
+                            if !item.is_empty() {
+                                to_return.push(item);
+                            }
                         }
                     }
+                    OpenMenu::Workstation(mut ws) => {
+                        to_return.extend(ws.close_drops());
+                    }
+                    _ => {}
                 }
             }
             if !p.inventory.carried.is_empty() {
@@ -2157,6 +2611,324 @@ impl SimState {
                     &p.inventory.slots,
                     &p.inventory.carried,
                 ));
+            }
+        }
+    }
+
+    fn execute_dispenser_fire(&mut self, pos: BlockPos, now: u64) {
+        let st = self.world.get_block(pos);
+        let Some(facing) = dispenser_facing(st) else {
+            return;
+        };
+        let (dx, dy, dz) = facing_offset(facing);
+        let front_pos = pos.offset(dx, dy, dz);
+        let front_state = self.world.get_block(front_pos);
+        let front_has_container = is_container_block(front_state);
+
+        let seed = now
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add((pos.x as u64).wrapping_mul(31))
+            .wrapping_add((pos.y as u64).wrapping_mul(131))
+            .wrapping_add((pos.z as u64).wrapping_mul(997));
+
+        let action = {
+            let Some(be) = self.world.ensure_block_entity(pos) else {
+                return;
+            };
+            let BlockEntityKind::Dispenser {
+                is_dropper,
+                ref mut items,
+            } = be.kind
+            else {
+                return;
+            };
+            dispense_from_slots(
+                is_dropper,
+                pos,
+                facing,
+                items,
+                front_state,
+                front_has_container,
+                seed,
+            )
+        };
+
+        let mut sound_event = 1000_i32; // DISPENSER_DISPENSE
+        match action {
+            DispenserAction::EmptyClick { pos } => {
+                sound_event = 1001; // DISPENSER_FAIL
+                let lp = encode_play_level_event(sound_event, pos, 0, false);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(lp.clone());
+                }
+                return;
+            }
+            DispenserAction::DropItem { pos: dpos, vel, stack } => {
+                let eid = self.alloc_entity_id();
+                self.spawn_world_entity(WorldEntity::spawn_item(eid, dpos, vel, stack, 10));
+            }
+            DispenserAction::TransferToContainer { target_pos, stack } => {
+                let inserted = self
+                    .world
+                    .ensure_block_entity(target_pos)
+                    .map(|dst| dst.try_insert_one(&stack, dy == -1))
+                    .unwrap_or(false);
+                if inserted {
+                    self.sync_open_block_container(target_pos);
+                } else {
+                    let eid = self.alloc_entity_id();
+                    let dpos = Vec3::new(
+                        front_pos.x as f64 + 0.5,
+                        front_pos.y as f64 + 0.5,
+                        front_pos.z as f64 + 0.5,
+                    );
+                    self.spawn_world_entity(WorldEntity::spawn_item(
+                        eid,
+                        dpos,
+                        Vec3::new(dx as f64 * 0.2, 0.15, dz as f64 * 0.2),
+                        stack,
+                        10,
+                    ));
+                }
+            }
+            DispenserAction::SpawnProjectile {
+                kind_name,
+                pos: spos,
+                vel,
+                damage,
+            } => {
+                sound_event = 1002; // DISPENSER_LAUNCH
+                let eid = self.alloc_entity_id();
+                if let Some(mut proj) =
+                    WorldEntity::spawn_projectile(eid, kind_name, 0, spos, 0.0, 0.0, 0.0, damage)
+                {
+                    proj.vel = vel;
+                    self.spawn_world_entity(proj);
+                }
+            }
+            DispenserAction::IgniteTnt { pos: tpos } => {
+                let _ = self.world.set_block_and_relight(tpos, BlockStateId::AIR);
+                self.broadcast_block_changes(&[(tpos, BlockStateId::AIR)]);
+                self.trigger_explosion(
+                    Vec3::new(tpos.x as f64 + 0.5, tpos.y as f64 + 0.5, tpos.z as f64 + 0.5),
+                    4.0,
+                    false,
+                );
+            }
+            DispenserAction::PlaceBlock { pos: bpos, state } => {
+                if self.world.set_block_and_relight(bpos, state).is_some() {
+                    let mut ch = vec![(bpos, state)];
+                    ch.extend(propagate_neighbor_updates(
+                        &mut self.world,
+                        &mut self.scheduler,
+                        now,
+                        &[bpos],
+                    ));
+                    self.broadcast_block_changes(&ch);
+                }
+            }
+            DispenserAction::PickupFluid { pos: bpos } => {
+                if self.world.set_block_and_relight(bpos, BlockStateId::AIR).is_some() {
+                    let mut ch = vec![(bpos, BlockStateId::AIR)];
+                    ch.extend(propagate_neighbor_updates(
+                        &mut self.world,
+                        &mut self.scheduler,
+                        now,
+                        &[bpos],
+                    ));
+                    self.broadcast_block_changes(&ch);
+                }
+            }
+            DispenserAction::SpawnMobEgg { entity_type, pos: spos } => {
+                let eid = self.alloc_entity_id();
+                if let Some(mob) = WorldEntity::spawn_mob(eid, &entity_type, spos) {
+                    self.spawn_world_entity(mob);
+                }
+            }
+        }
+
+        let lp = encode_play_level_event(sound_event, pos, 0, false);
+        for (_, p) in self.players.iter() {
+            let _ = p.tx.send(lp.clone());
+        }
+        self.sync_open_block_container(pos);
+    }
+
+    fn handle_bed_interact(&mut self, handle: PlayerHandle, bed_pos: BlockPos) {
+        let Some((player_eid, player_pos, is_overworld)) = self
+            .players
+            .get(handle)
+            .map(|p| (p.entity_id, p.pos, p.dimension == DimensionId::Overworld))
+        else {
+            return;
+        };
+        let total_overworld = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.dimension == DimensionId::Overworld)
+            .count()
+            .max(1);
+        let pct = self.world.gamerules.players_sleeping_percentage();
+
+        match self.sleep_manager.try_sleep(
+            player_eid,
+            player_pos,
+            bed_pos,
+            is_overworld,
+            self.world.day_time,
+            self.world.raining,
+            self.world.thundering,
+            total_overworld,
+            pct,
+        ) {
+            BedInteractResult::ExplodeInDimension { pos } => {
+                let _ = self.world.set_block_and_relight(pos, BlockStateId::AIR);
+                self.broadcast_block_changes(&[(pos, BlockStateId::AIR)]);
+                self.trigger_explosion(
+                    Vec3::new(pos.x as f64 + 0.5, pos.y as f64 + 0.5, pos.z as f64 + 0.5),
+                    BED_EXPLOSION_POWER,
+                    true,
+                );
+            }
+            BedInteractResult::SetSpawnAndNotNight { spawn_pos } => {
+                if let Some(p) = self.players.get_mut(handle) {
+                    p.spawnpoint = Some(spawn_pos);
+                    if let Ok(pkt) = encode_play_system_chat("Respawn point set", false) {
+                        let _ = p.tx.send(pkt);
+                    }
+                    if let Ok(pkt) = encode_play_set_action_bar_text(
+                        "You can sleep only at night or during thunderstorms",
+                    ) {
+                        let _ = p.tx.send(pkt);
+                    }
+                }
+            }
+            BedInteractResult::TooFar => {
+                if let Some(p) = self.players.get(handle) {
+                    if let Ok(pkt) = encode_play_set_action_bar_text(
+                        "You may not rest now; the bed is too far away",
+                    ) {
+                        let _ = p.tx.send(pkt);
+                    }
+                }
+            }
+            BedInteractResult::StartedSleeping {
+                bed_pos,
+                sleeping_count,
+                required_count,
+            } => {
+                if let Some(p) = self.players.get_mut(handle) {
+                    p.spawnpoint = Some(bed_pos);
+                }
+                let bar_msg = if required_count == usize::MAX {
+                    format!("{sleeping_count} player(s) sleeping (night skip disabled)")
+                } else {
+                    format!("{sleeping_count}/{required_count} players sleeping")
+                };
+                if let Ok(pkt) = encode_play_set_action_bar_text(&bar_msg) {
+                    for (_, p) in self.players.iter() {
+                        let _ = p.tx.send(pkt.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_entity_interact(
+        &mut self,
+        handle: PlayerHandle,
+        target_eid: i32,
+        hand: InteractionHand,
+    ) {
+        let Some((player_eid, player_uuid, held_name, offhand, is_survival)) =
+            self.players.get(handle).map(|p| {
+                let off = hand == InteractionHand::OffHand;
+                let st = if off {
+                    p.inventory.offhand_item()
+                } else {
+                    p.inventory.held_item()
+                };
+                let name = item_by_id(st.item_id).map(|i| i.name.to_string());
+                (p.entity_id, p.profile.uuid, name, off, p.gamemode == 0)
+            })
+        else {
+            return;
+        };
+
+        let Some(ent_clone) = self
+            .entities
+            .iter()
+            .find_map(|(_, e)| if e.entity_id == target_eid { Some(e.clone()) } else { None })
+        else {
+            return;
+        };
+
+        let now = self.world.game_time as u64;
+        let outcome = self.live_entities.interact_entity(
+            &ent_clone,
+            player_eid,
+            player_uuid,
+            held_name.as_deref(),
+            now,
+        );
+
+        match outcome {
+            MobInteractOutcome::None => {}
+            MobInteractOutcome::ConsumedItem {
+                hearts,
+                tamed,
+                toggled_sit,
+            } => {
+                if !toggled_sit && is_survival {
+                    if let Some(p) = self.players.get_mut(handle) {
+                        if let Some((slot_idx, updated)) = p.inventory.consume_one(offhand) {
+                            let sid = p.inventory.next_state_id();
+                            let _ = p.tx.send(encode_play_container_set_slot(
+                                0, sid, slot_idx, &updated,
+                            ));
+                        }
+                    }
+                }
+                if hearts || tamed {
+                    let ev_status = if tamed { 7_i8 } else { 18_i8 }; // TAME_SUCCEEDED / LOVE_HEARTS
+                    let ev = encode_play_entity_event(target_eid, ev_status);
+                    for (_, p) in self.players.iter() {
+                        let _ = p.tx.send(ev.clone());
+                    }
+                }
+            }
+            MobInteractOutcome::OpenVillagerTrade {
+                villager_eid,
+                profession,
+                level,
+                xp,
+            } => {
+                if let Some(p) = self.players.get_mut(handle) {
+                    let cid = p.next_container_id;
+                    p.next_container_id = (p.next_container_id % 100) + 1;
+                    let ws = WorkstationMenu::new_merchant_default(
+                        cid,
+                        villager_eid,
+                        profession,
+                        level,
+                        xp,
+                    );
+                    p.inventory.next_state_id();
+                    let packets = ws.open_packets(&p.inventory);
+                    p.open_menu = Some(OpenMenu::Workstation(ws));
+                    for pkt in packets {
+                        let _ = p.tx.send(pkt);
+                    }
+                }
+            }
+            MobInteractOutcome::MountedVehicle {
+                vehicle_eid,
+                passengers,
+            } => {
+                let pkt = encode_play_set_passengers(vehicle_eid, &passengers);
+                for (_, p) in self.players.iter() {
+                    let _ = p.tx.send(pkt.clone());
+                }
             }
         }
     }
@@ -2312,7 +3084,7 @@ impl SimState {
                 &p.inventory.slots,
                 &p.inventory.carried,
             ));
-            stream_chunks_for_player(p, &mut self.world);
+            let _ = stream_chunks_for_player(p, &mut self.world, &mut self.overworld_tickets);
         }
     }
 
@@ -2340,6 +3112,11 @@ impl SimState {
         let hashed_seed = self.world.hashed_seed;
 
         if let Some(p) = self.players.get_mut(handle) {
+            if p.dimension == DimensionId::Overworld {
+                for &old_cp in &p.loaded_chunks {
+                    self.overworld_tickets.remove_player_ticket(old_cp);
+                }
+            }
             p.dimension = target;
             p.pos = dest_vec;
             p.fall_distance = 0.0;
@@ -2378,6 +3155,9 @@ impl SimState {
                     let chunk = self.world.get_or_load_chunk_in(target, cp);
                     let _ = p.tx.send(encode_play_level_chunk_with_light(chunk));
                     p.loaded_chunks.insert(cp);
+                    if target == DimensionId::Overworld {
+                        self.overworld_tickets.add_player_ticket(cp);
+                    }
                     sent += 1;
                 }
             }
@@ -2740,13 +3520,17 @@ fn abilities_packet_for_gamemode(gamemode: i32) -> Vec<u8> {
     encode_play_player_abilities(invulnerable, flying, may_fly, instabuild, 0.05, 0.1)
 }
 
-fn stream_chunks_for_player(p: &mut PlayerEntity, world: &mut WorldStore) {
+fn stream_chunks_for_player(
+    p: &mut PlayerEntity,
+    world: &mut WorldStore,
+    overworld_tickets: &mut ChunkTicketManager,
+) -> Vec<ChunkPos> {
     let new_center = ChunkPos::new(
         (p.pos.x.floor() as i32) >> 4,
         (p.pos.z.floor() as i32) >> 4,
     );
     if new_center == p.center_chunk {
-        return;
+        return Vec::new();
     }
     p.center_chunk = new_center;
     let _ = p
@@ -2758,6 +3542,9 @@ fn stream_chunks_for_player(p: &mut PlayerEntity, world: &mut WorldStore) {
         for dx in -r..=r {
             let cp = ChunkPos::new(new_center.x + dx, new_center.z + dz);
             if p.loaded_chunks.insert(cp) {
+                if p.dimension == DimensionId::Overworld {
+                    overworld_tickets.add_player_ticket(cp);
+                }
                 to_send.push(cp);
             }
         }
@@ -2772,6 +3559,30 @@ fn stream_chunks_for_player(p: &mut PlayerEntity, world: &mut WorldStore) {
             .tx
             .send(encode_play_chunk_batch_finished(to_send.len() as i32));
     }
+
+    // Evict chunks outside view_distance + 1 and send ClientboundForgetLevelChunkPacket
+    let keep_radius = r + 1;
+    let to_unload: Vec<ChunkPos> = p
+        .loaded_chunks
+        .iter()
+        .copied()
+        .filter(|cp| {
+            (cp.x - new_center.x).abs() > keep_radius || (cp.z - new_center.z).abs() > keep_radius
+        })
+        .collect();
+    for cp in to_unload {
+        p.loaded_chunks.remove(&cp);
+        let _ = p.tx.send(encode_play_forget_level_chunk(cp.x, cp.z));
+        if p.dimension == DimensionId::Overworld {
+            overworld_tickets.remove_player_ticket(cp);
+        }
+    }
+
+    if p.dimension == DimensionId::Overworld {
+        to_send
+    } else {
+        Vec::new()
+    }
 }
 
 async fn run_tick_loop(
@@ -2785,12 +3596,18 @@ async fn run_tick_loop(
     let end_dim_id = ctx.datapacks.dimension_type_id("minecraft:the_end") as i32;
     let overworld_clock_id = ctx.datapacks.world_clock_id("minecraft:overworld") as i32;
     let admin = AdminStore::load(&ctx.config.world_dir, ctx.config.white_list);
+    let mut overworld_tickets = ChunkTicketManager::new();
+    overworld_tickets.pin_chunk(world.spawn_pos.chunk_pos());
     let mut sim = SimState {
         world,
         admin,
         scoreboard: ScoreboardStore::new(),
         players: Arena::new(),
         entities: Arena::new(),
+        live_entities: LiveEntityManager::new(),
+        sleep_manager: SleepManager::new(),
+        overworld_tickets,
+        loaded_entity_chunks: HashSet::new(),
         scheduler: TickScheduler::new(),
         next_entity_id: 1,
         overworld_dim_id,
@@ -3059,6 +3876,7 @@ fn process_event(
             ));
 
             let mut loaded_chunks = HashSet::new();
+            let mut initial_overworld_chunks = Vec::new();
             let _ = tx.send(encode_play_chunk_batch_start());
             let mut sent_chunks = 0;
             for dz in -radius..=radius {
@@ -3067,10 +3885,17 @@ fn process_event(
                     let chunk = sim.world.get_or_load_chunk_in(dimension, cp);
                     let _ = tx.send(encode_play_level_chunk_with_light(chunk));
                     loaded_chunks.insert(cp);
+                    if dimension == DimensionId::Overworld {
+                        sim.overworld_tickets.add_player_ticket(cp);
+                        initial_overworld_chunks.push(cp);
+                    }
                     sent_chunks += 1;
                 }
             }
             let _ = tx.send(encode_play_chunk_batch_finished(sent_chunks));
+            if !initial_overworld_chunks.is_empty() {
+                sim.load_entities_for_chunks(&initial_overworld_chunks);
+            }
 
             let _ = tx.send(encode_play_player_position(
                 1,
@@ -3162,6 +3987,8 @@ fn process_event(
                     .send(encode_play_system_chat(&join_msg, false).unwrap_or_default());
             }
 
+            let enchantment_seed =
+                i32::from_be_bytes(profile.uuid.as_bytes()[0..4].try_into().unwrap_or([1, 2, 3, 4]));
             let name = profile.name.clone();
             let advancements = PlayerAdvancements::load(sim.world.world_dir(), profile.uuid);
             let handle = sim.players.insert(PlayerEntity {
@@ -3181,6 +4008,7 @@ fn process_event(
                 xp_level,
                 xp_progress,
                 xp_total,
+                enchantment_seed,
                 portal_cooldown: 0,
                 effects: Vec::new(),
                 advancements,
@@ -3212,6 +4040,11 @@ fn process_event(
             let mut time_broadcast: Option<i64> = None;
             let mut pending_command: Option<(String, Vec3)> = None;
             let mut pending_attack: Option<i32> = None;
+            let mut pending_interact: Option<(i32, InteractionHand)> = None;
+            let mut pending_bed_use: Option<BlockPos> = None;
+            let mut pending_vehicle_spawn: Option<(mc_world::VehicleKind, &'static str, Vec3, f32)> =
+                None;
+            let mut newly_streamed_chunks: Vec<ChunkPos> = Vec::new();
             let mut pending_fall_damage: f32 = 0.0;
             let mut pending_open_menu: Option<BlockPos> = None;
             let mut pending_container_click: Option<(i32, i16, i8, ContainerClickType)> = None;
@@ -3321,6 +4154,11 @@ fn process_event(
                     }
                     PlayServerbound::Attack { entity_id } => {
                         pending_attack = Some(entity_id);
+                    }
+                    PlayServerbound::Interact {
+                        entity_id, hand, ..
+                    } => {
+                        pending_interact = Some((entity_id, hand));
                     }
                     PlayServerbound::ContainerClick {
                         container_id,
@@ -3514,10 +4352,19 @@ fn process_event(
                                 | KIND_BLAST_FURNACE
                                 | KIND_SMOKER
                                 | KIND_HOPPER
+                                | KIND_DISPENSER
+                                | KIND_DROPPER
+                                | KIND_BREWING_STAND
+                                | KIND_ENCHANTING_TABLE
+                                | KIND_ANVIL
+                                | KIND_SMITHING_TABLE
+                                | KIND_STONECUTTER
                                 | KIND_CRAFTING_TABLE
                         );
                         if opens_screen {
                             pending_open_menu = Some(hit.pos);
+                        } else if clicked_kind == KIND_BED {
+                            pending_bed_use = Some(hit.pos);
                         } else if clicked_kind == KIND_SIGN {
                             let _ = p.tx.send(encode_play_open_sign_editor(hit.pos, true));
                         } else if let Some(interacted) =
@@ -3532,7 +4379,27 @@ fn process_event(
                                 p.inventory.held_item()
                             };
                             let held_name = item_by_id(item.item_id).map(|i| i.name).unwrap_or("");
-                            if held_name == "minecraft:flint_and_steel" {
+                            if let Some((vkind, etype)) = vehicle_kind_from_item(held_name) {
+                                let spawn_bp = hit.direction.offset_pos(hit.pos);
+                                pending_vehicle_spawn = Some((
+                                    vkind,
+                                    etype,
+                                    Vec3::new(
+                                        spawn_bp.x as f64 + 0.5,
+                                        spawn_bp.y as f64 + 0.1,
+                                        spawn_bp.z as f64 + 0.5,
+                                    ),
+                                    p.yaw,
+                                ));
+                                if p.gamemode == 0 {
+                                    if let Some((slot_idx, updated)) = p.inventory.consume_one(offhand) {
+                                        let sid = p.inventory.next_state_id();
+                                        let _ = p.tx.send(encode_play_container_set_slot(
+                                            0, sid, slot_idx, &updated,
+                                        ));
+                                    }
+                                }
+                            } else if held_name == "minecraft:flint_and_steel" {
                                 let clicked_state = sim.world.get_block(hit.pos);
                                 if is_tnt(clicked_state.0) {
                                     let _ = sim.world.set_block_and_relight(hit.pos, BlockStateId::AIR);
@@ -3735,11 +4602,31 @@ fn process_event(
                     _ => {}
                 }
 
-                stream_chunks_for_player(p, &mut sim.world);
+                newly_streamed_chunks =
+                    stream_chunks_for_player(p, &mut sim.world, &mut sim.overworld_tickets);
+            }
+
+            if !newly_streamed_chunks.is_empty() {
+                sim.load_entities_for_chunks(&newly_streamed_chunks);
             }
 
             if let Some(pos) = pending_open_menu {
                 sim.open_block_menu(handle, pos);
+            }
+
+            if let Some(bed_pos) = pending_bed_use {
+                sim.handle_bed_interact(handle, bed_pos);
+            }
+
+            if let Some((target_eid, hand)) = pending_interact {
+                sim.handle_entity_interact(handle, target_eid, hand);
+            }
+
+            if let Some((vkind, etype, vpos, vyaw)) = pending_vehicle_spawn {
+                let eid = sim.alloc_entity_id();
+                if let Some(vent) = sim.live_entities.spawn_vehicle(eid, vkind, etype, vpos, vyaw) {
+                    sim.spawn_world_entity(vent);
+                }
             }
 
             if let Some((cid, slot_num, button_num, click_type)) = pending_container_click {
@@ -3886,6 +4773,7 @@ fn process_event(
                     }
                     if died {
                         sim.entities.remove(th);
+                        sim.live_entities.remove_entity(target_eid);
                         let rm = encode_play_remove_entities(&[target_eid]);
                         for (_, p) in sim.players.iter() {
                             let _ = p.tx.send(rm.clone());
@@ -3995,7 +4883,11 @@ fn process_event(
                                 p.pitch,
                                 0,
                             ));
-                            stream_chunks_for_player(p, &mut sim.world);
+                            let _ = stream_chunks_for_player(
+                                p,
+                                &mut sim.world,
+                                &mut sim.overworld_tickets,
+                            );
                             moved = Some((p.entity_id, p.pos, p.yaw, p.pitch, p.on_ground));
                             if let Ok(pkt) = encode_play_system_chat(
                                 &format!("Teleported to {:.2}, {:.2}, {:.2}", dest.x, dest.y, dest.z),
@@ -4383,8 +5275,8 @@ fn process_event(
             }
         }
 
-        TickEvent::ExtraPacket { handle, packet } => {
-            if let PlayExtraServerbound::Swing { hand } = packet {
+        TickEvent::ExtraPacket { handle, packet } => match packet {
+            PlayExtraServerbound::Swing { hand } => {
                 if let Some(eid) = sim.players.get(handle).map(|p| p.entity_id) {
                     let spkt = encode_play_swing_animation(eid, hand, SwingAnimationType::Whack, 6);
                     for (other_h, other) in sim.players.iter() {
@@ -4394,10 +5286,145 @@ fn process_event(
                     }
                 }
             }
-        }
+            PlayExtraServerbound::ContainerButtonClick {
+                container_id,
+                button_id,
+            } => {
+                if let Some(p) = sim.players.get_mut(handle) {
+                    if let Some(OpenMenu::Workstation(ref mut ws)) = p.open_menu {
+                        if ws.container_id() == container_id {
+                            let is_creative = p.gamemode == 1;
+                            let out = ws.handle_button_click(
+                                &mut p.inventory,
+                                button_id,
+                                p.xp_level,
+                                is_creative,
+                            );
+                            if out.xp_level_delta != 0 {
+                                p.xp_level = (p.xp_level + out.xp_level_delta).max(0);
+                                let _ = p.tx.send(encode_play_set_experience(
+                                    p.xp_progress,
+                                    p.xp_level,
+                                    p.xp_total,
+                                ));
+                            }
+                            if let Some(seed) = out.new_enchant_seed {
+                                p.enchantment_seed = seed;
+                            }
+                            for pkt in out.packets {
+                                let _ = p.tx.send(pkt);
+                            }
+                        }
+                    }
+                }
+            }
+            PlayExtraServerbound::RenameItem { name } => {
+                if let Some(p) = sim.players.get_mut(handle) {
+                    if let Some(OpenMenu::Workstation(ref mut ws)) = p.open_menu {
+                        p.inventory.next_state_id();
+                        let packets = ws.handle_rename_item(&p.inventory, name);
+                        for pkt in packets {
+                            let _ = p.tx.send(pkt);
+                        }
+                    }
+                }
+            }
+            PlayExtraServerbound::SelectTrade { item } => {
+                if let Some(p) = sim.players.get_mut(handle) {
+                    if let Some(OpenMenu::Workstation(ref mut ws)) = p.open_menu {
+                        let packets = ws.handle_select_trade(&mut p.inventory, item);
+                        for pkt in packets {
+                            let _ = p.tx.send(pkt);
+                        }
+                    }
+                }
+            }
+            PlayExtraServerbound::MoveVehicle {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                on_ground,
+            } => {
+                let rider_eid = sim.players.get(handle).map(|p| p.entity_id);
+                if let Some(reid) = rider_eid {
+                    let new_pos = Vec3::new(x, y, z);
+                    let handles: Vec<Handle<WorldEntity>> =
+                        sim.entities.iter().map(|(h, _)| h).collect();
+                    let mut buf: Vec<WorldEntity> = handles
+                        .iter()
+                        .filter_map(|&h| sim.entities.get(h).cloned())
+                        .collect();
+                    if let Some(vid) =
+                        sim.live_entities
+                            .handle_move_vehicle(reid, new_pos, yaw, pitch, &mut buf)
+                    {
+                        for (h, ent) in handles.into_iter().zip(buf.into_iter()) {
+                            if let Some(slot) = sim.entities.get_mut(h) {
+                                *slot = ent;
+                            }
+                        }
+                        if let Some(p) = sim.players.get_mut(handle) {
+                            p.pos = new_pos;
+                            p.yaw = yaw;
+                            p.pitch = pitch;
+                            let _ = stream_chunks_for_player(
+                                p,
+                                &mut sim.world,
+                                &mut sim.overworld_tickets,
+                            );
+                        }
+                        let vp =
+                            encode_play_entity_position_sync(vid, new_pos, yaw, pitch, on_ground);
+                        for (_, other) in sim.players.iter() {
+                            let _ = other.tx.send(vp.clone());
+                        }
+                    }
+                }
+            }
+            PlayExtraServerbound::PlayerInput { flags } => {
+                if (flags & player_input_flags::SHIFT) != 0 {
+                    if let Some(reid) = sim.players.get(handle).map(|p| p.entity_id) {
+                        if let Some((vid, remaining)) = sim.live_entities.dismount_rider(reid) {
+                            let pkt = encode_play_set_passengers(vid, &remaining);
+                            for (_, other) in sim.players.iter() {
+                                let _ = other.tx.send(pkt.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            PlayExtraServerbound::PlayerCommand { action_id, .. } => {
+                if action_id == 0 {
+                    // STOP_SLEEPING
+                    if let Some(eid) = sim.players.get(handle).map(|p| p.entity_id) {
+                        if sim.sleep_manager.wake_player(eid) {
+                            let pkt = encode_play_animate(eid, animate_action::WAKE_UP);
+                            for (_, other) in sim.players.iter() {
+                                let _ = other.tx.send(pkt.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            PlayExtraServerbound::PlayerAbilities { .. } => {}
+        },
 
         TickEvent::Disconnect { handle } => {
             if let Some(removed) = sim.players.remove(handle) {
+                if removed.dimension == DimensionId::Overworld {
+                    for &cp in &removed.loaded_chunks {
+                        sim.overworld_tickets.remove_player_ticket(cp);
+                    }
+                }
+                sim.sleep_manager.wake_player(removed.entity_id);
+                if let Some((vid, remaining)) = sim.live_entities.dismount_rider(removed.entity_id) {
+                    let ppkt = encode_play_set_passengers(vid, &remaining);
+                    for (_, other) in sim.players.iter() {
+                        let _ = other.tx.send(ppkt.clone());
+                    }
+                }
                 if let Err(e) = save_player_data(
                     sim.world.world_dir(),
                     removed.profile.uuid,
