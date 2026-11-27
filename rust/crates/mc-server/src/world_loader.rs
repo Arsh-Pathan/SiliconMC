@@ -1,11 +1,14 @@
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use mc_data::block_behaviors::{
     KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_FURNACE, KIND_HOPPER, KIND_SMOKER,
     block_behavior,
 };
 use mc_data::recipes::{COOK_BLASTING, COOK_SMELTING, COOK_SMOKING};
-use mc_data::{BlockStateId, LoadedDatapacks};
+use mc_data::{BlockStateId, LoadedDatapacks, WORLD_VERSION};
 use mc_math::{BlockPos, ChunkPos};
+use mc_nbt::{NbtCompound, NbtTag};
 use mc_world::{
     BlockEntity, BlockEntityKind, BlockWorld, Chunk, DirtyLightSections, FurnaceTickResult,
     LightEngine, OVERWORLD_MIN_SECTION_Y, OVERWORLD_SECTION_COUNT, RegionFile,
@@ -18,7 +21,7 @@ use mc_worldgen::{
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -78,6 +81,10 @@ pub struct WorldStore {
     pub hashed_seed: i64,
     pub game_time: i64,
     pub day_time: i64,
+    pub raining: bool,
+    pub rain_time: i32,
+    pub thundering: bool,
+    pub thunder_time: i32,
     generator: Option<OverworldGenerator>,
     nether_generator: NetherGenerator,
     end_generator: EndGenerator,
@@ -97,14 +104,26 @@ impl WorldStore {
         let region_dir = world_dir.join("region");
         let mut spawn_pos = BlockPos::new(0, -60, 0);
         let mut seed = default_seed;
+        let mut game_time = 0i64;
+        let mut day_time = 6000i64;
+        let mut raining = false;
+        let mut rain_time = 24000i32;
+        let mut thundering = false;
+        let mut thunder_time = 24000i32;
         let mut loaded_level_dat = false;
 
         let level_dat = world_dir.join("level.dat");
         if level_dat.is_file() {
             match Self::read_level_dat(&level_dat) {
-                Ok((sp, s)) => {
+                Ok((sp, s, gt, dt, r, rt, th, tht)) => {
                     spawn_pos = sp;
                     seed = s;
+                    game_time = gt;
+                    day_time = dt;
+                    raining = r;
+                    rain_time = rt;
+                    thundering = th;
+                    thunder_time = tht;
                     loaded_level_dat = true;
                     info!(
                         "Loaded level.dat from {}: seed={}, spawn=({}, {}, {})",
@@ -150,8 +169,12 @@ impl WorldStore {
             seed,
             spawn_pos,
             hashed_seed,
-            game_time: 0,
-            day_time: 6000,
+            game_time,
+            day_time,
+            raining,
+            rain_time,
+            thundering,
+            thunder_time,
             generator,
             nether_generator: NetherGenerator::new(seed),
             end_generator: EndGenerator::new(seed),
@@ -161,7 +184,11 @@ impl WorldStore {
         }
     }
 
-    fn read_level_dat(path: &Path) -> Result<(BlockPos, i64), String> {
+    pub fn world_dir(&self) -> &Path {
+        &self.world_dir
+    }
+
+    fn read_level_dat(path: &Path) -> Result<(BlockPos, i64, i64, i64, bool, i32, bool, i32), String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let mut gz = GzDecoder::new(file);
         let mut raw = Vec::new();
@@ -177,7 +204,80 @@ impl WorldStore {
             .get_compound("WorldGenSettings")
             .and_then(|w| w.get_long("seed"))
             .unwrap_or(0);
-        Ok((BlockPos::new(sx, sy, sz), seed))
+        let game_time = data.get_long("Time").unwrap_or(0);
+        let day_time = data.get_long("DayTime").unwrap_or(6000);
+        let raining = data.get_byte("raining").unwrap_or(0) != 0;
+        let rain_time = data.get_int("rainTime").unwrap_or(24000);
+        let thundering = data.get_byte("thundering").unwrap_or(0) != 0;
+        let thunder_time = data.get_int("thunderTime").unwrap_or(24000);
+        Ok((
+            BlockPos::new(sx, sy, sz),
+            seed,
+            game_time,
+            day_time,
+            raining,
+            rain_time,
+            thundering,
+            thunder_time,
+        ))
+    }
+
+    /// Write exact Minecraft 26.3 gzipped NBT `level.dat`.
+    pub fn write_level_dat(&self) -> Result<(), String> {
+        std::fs::create_dir_all(&self.world_dir).map_err(|e| e.to_string())?;
+        let path = self.world_dir.join("level.dat");
+        let tmp = self.world_dir.join("level.dat.tmp");
+
+        let mut wgs = NbtCompound::new();
+        wgs.insert("seed", NbtTag::Long(self.seed));
+        wgs.insert("generate_features", NbtTag::Byte(1));
+
+        let mut version = NbtCompound::new();
+        version.insert("Id", NbtTag::Int(WORLD_VERSION));
+        version.insert("Name", NbtTag::String("26.3".into()));
+        version.insert("Series", NbtTag::String("main".into()));
+        version.insert("Snapshot", NbtTag::Byte(0));
+
+        let mut data = NbtCompound::new();
+        data.insert("DataVersion", NbtTag::Int(WORLD_VERSION));
+        data.insert("version", NbtTag::Int(19133));
+        data.insert("Version", NbtTag::Compound(version));
+        data.insert(
+            "LevelName",
+            NbtTag::String(
+                self.world_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("world")
+                    .to_string(),
+            ),
+        );
+        data.insert("Time", NbtTag::Long(self.game_time));
+        data.insert("DayTime", NbtTag::Long(self.day_time));
+        data.insert("SpawnX", NbtTag::Int(self.spawn_pos.x));
+        data.insert("SpawnY", NbtTag::Int(self.spawn_pos.y));
+        data.insert("SpawnZ", NbtTag::Int(self.spawn_pos.z));
+        data.insert("raining", NbtTag::Byte(if self.raining { 1 } else { 0 }));
+        data.insert("rainTime", NbtTag::Int(self.rain_time));
+        data.insert(
+            "thundering",
+            NbtTag::Byte(if self.thundering { 1 } else { 0 }),
+        );
+        data.insert("thunderTime", NbtTag::Int(self.thunder_time));
+        data.insert("WorldGenSettings", NbtTag::Compound(wgs));
+
+        let mut root = NbtCompound::new();
+        root.insert("Data", NbtTag::Compound(data));
+
+        let raw = mc_nbt::write_file_bytes("", &root).map_err(|e| e.to_string())?;
+        {
+            let file = File::create(&tmp).map_err(|e| e.to_string())?;
+            let mut gz = GzEncoder::new(file, Compression::default());
+            gz.write_all(&raw).map_err(|e| e.to_string())?;
+            gz.finish().map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn biome_name_at(&self, x: i32, y: i32, z: i32) -> &'static str {
@@ -475,16 +575,19 @@ impl WorldStore {
         modified
     }
 
-    pub fn save_dirty_chunks(&mut self) -> Result<usize, String> {
-        let dirty_positions: Vec<ChunkPos> = self
-            .chunks
+    fn save_dim_dirty(
+        rdir: &Path,
+        map: &mut HashMap<ChunkPos, Chunk>,
+        datapacks: &LoadedDatapacks,
+    ) -> Result<usize, String> {
+        let dirty_positions: Vec<ChunkPos> = map
             .iter()
             .filter_map(|(&pos, c)| if c.dirty { Some(pos) } else { None })
             .collect();
         if dirty_positions.is_empty() {
             return Ok(0);
         }
-        std::fs::create_dir_all(&self.region_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(rdir).map_err(|e| e.to_string())?;
 
         let mut by_region: HashMap<(i32, i32), Vec<ChunkPos>> = HashMap::new();
         for pos in dirty_positions {
@@ -496,19 +599,32 @@ impl WorldStore {
 
         let mut saved = 0usize;
         for ((rx, rz), positions) in by_region {
-            let mca_path = self.region_dir.join(format!("r.{rx}.{rz}.mca"));
+            let mca_path = rdir.join(format!("r.{rx}.{rz}.mca"));
             let mut rf = RegionFile::open(&mca_path).map_err(|e| e.to_string())?;
             for pos in positions {
-                if let Some(chunk) = self.chunks.get_mut(&pos) {
-                    let nbt = chunk.to_nbt(&self.datapacks);
+                if let Some(chunk) = map.get_mut(&pos) {
+                    let nbt = chunk.to_nbt(datapacks);
                     rf.write_chunk_nbt(pos, &nbt).map_err(|e| e.to_string())?;
                     chunk.dirty = false;
                     saved += 1;
                 }
             }
         }
-        info!("Saved {saved} dirty chunk(s) to {}", self.region_dir.display());
         Ok(saved)
+    }
+
+    pub fn save_dirty_chunks(&mut self) -> Result<usize, String> {
+        let mut total = 0usize;
+        total += Self::save_dim_dirty(&self.region_dir, &mut self.chunks, &self.datapacks)?;
+        let nether_dir = self.world_dir.join(DimensionId::Nether.region_subdir());
+        total += Self::save_dim_dirty(&nether_dir, &mut self.nether_chunks, &self.datapacks)?;
+        let end_dir = self.world_dir.join(DimensionId::End.region_subdir());
+        total += Self::save_dim_dirty(&end_dir, &mut self.end_chunks, &self.datapacks)?;
+        self.write_level_dat()?;
+        if total > 0 {
+            info!("Saved {total} dirty chunk(s) and level.dat under {}", self.world_dir.display());
+        }
+        Ok(total)
     }
 
     fn try_load_from_mca_in(&self, dim: DimensionId, pos: ChunkPos) -> Option<Chunk> {
@@ -556,5 +672,11 @@ impl BlockWorld for WorldStore {
         chunk
             .set_block((pos.x & 15) as usize, pos.y, (pos.z & 15) as usize, state)
             .is_some()
+    }
+
+    fn container_comparator_signal(&self, pos: BlockPos) -> u8 {
+        self.get_block_entity(pos)
+            .map(|be| be.comparator_signal())
+            .unwrap_or(0)
     }
 }

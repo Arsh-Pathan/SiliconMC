@@ -33,7 +33,7 @@ pub fn build_commands_packet() -> Vec<u8> {
     //     23: arg "pos" (minecraft:vec3 = 10), executable
     // 24: literal "kill", executable
     let nodes = vec![
-        CommandNodeEntry::root(vec![1, 3, 5, 8, 11, 15, 16, 17, 18, 19, 20, 21, 24, 25, 27, 29, 31, 33, 35, 37]),
+        CommandNodeEntry::root(vec![1, 3, 5, 8, 11, 15, 16, 17, 18, 19, 20, 21, 24, 25, 27, 29, 31, 33, 35, 37, 40, 42]),
         CommandNodeEntry::literal("gamemode", false, vec![2]),
         CommandNodeEntry::argument("gamemode", CommandArgType::GameMode, true, vec![]),
         CommandNodeEntry::literal("tp", false, vec![4]),
@@ -80,6 +80,10 @@ pub fn build_commands_packet() -> Vec<u8> {
         CommandNodeEntry::argument("action", CommandArgType::GreedyPhrase, true, vec![]),
         CommandNodeEntry::literal("place", false, vec![38]),
         CommandNodeEntry::literal("template", false, vec![39]),
+        CommandNodeEntry::argument("args", CommandArgType::GreedyPhrase, true, vec![]),
+        CommandNodeEntry::literal("weather", false, vec![41]),
+        CommandNodeEntry::argument("mode", CommandArgType::GreedyPhrase, true, vec![]),
+        CommandNodeEntry::literal("xp", false, vec![43]),
         CommandNodeEntry::argument("args", CommandArgType::GreedyPhrase, true, vec![]),
     ];
     encode_play_commands(&nodes, 0)
@@ -130,6 +134,16 @@ pub enum CommandAction {
         template_id: String,
         pos: BlockPos,
         rotation_deg: i32,
+    },
+    SetWeather {
+        raining: bool,
+        thundering: bool,
+        duration_ticks: i32,
+    },
+    Xp {
+        set_mode: bool,
+        amount: i32,
+        is_levels: bool,
     },
     StopServer,
 }
@@ -186,8 +200,67 @@ pub fn parse_command(raw: &str, sender_pos: Vec3) -> CommandAction {
 
     match parts[0].to_ascii_lowercase().as_str() {
         "help" => CommandAction::Reply(
-            "Commands: /gamemode, /tp, /setblock, /give, /summon, /kill, /dimension <overworld|nether|end>, /op, /deop, /ban, /pardon, /kick, /whitelist, /time, /seed, /biome, /save-all, /list, /stop".into()
+            "Commands: /gamemode, /tp, /setblock, /give, /summon, /kill, /dimension, /place template, /weather, /xp, /op, /deop, /ban, /pardon, /kick, /whitelist, /time, /seed, /biome, /save-all, /list, /stop".into()
         ),
+        "weather" => {
+            if parts.len() < 2 {
+                return CommandAction::Reply("Usage: /weather <clear|rain|thunder> [duration_seconds]".into());
+            }
+            let duration_secs: i32 = parts
+                .get(2)
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(600)
+                .clamp(1, 1_000_000);
+            let duration_ticks = duration_secs.saturating_mul(20);
+            match parts[1].to_ascii_lowercase().as_str() {
+                "clear" => CommandAction::SetWeather {
+                    raining: false,
+                    thundering: false,
+                    duration_ticks,
+                },
+                "rain" => CommandAction::SetWeather {
+                    raining: true,
+                    thundering: false,
+                    duration_ticks,
+                },
+                "thunder" => CommandAction::SetWeather {
+                    raining: true,
+                    thundering: true,
+                    duration_ticks,
+                },
+                other => CommandAction::Reply(format!("Unknown weather type: {other}")),
+            }
+        }
+        "xp" | "experience" => {
+            if parts.len() < 3 {
+                return CommandAction::Reply("Usage: /xp <add|set> <amount> [points|levels]".into());
+            }
+            let set_mode = match parts[1].to_ascii_lowercase().as_str() {
+                "add" => false,
+                "set" => true,
+                other => return CommandAction::Reply(format!("Unknown /xp action: {other}")),
+            };
+            // Support optional target player name before amount (vanilla `/xp add @s 50 points`)
+            let (amt_idx, unit_idx) = if parts[2].parse::<i32>().is_ok() {
+                (2, 3)
+            } else if parts.len() >= 4 {
+                (3, 4)
+            } else {
+                return CommandAction::Reply("Usage: /xp <add|set> <amount> [points|levels]".into());
+            };
+            let Ok(amount) = parts[amt_idx].parse::<i32>() else {
+                return CommandAction::Reply(format!("Invalid XP amount: {}", parts[amt_idx]));
+            };
+            let is_levels = parts
+                .get(unit_idx)
+                .map(|u| u.eq_ignore_ascii_case("levels") || u.eq_ignore_ascii_case("l"))
+                .unwrap_or(false);
+            CommandAction::Xp {
+                set_mode,
+                amount,
+                is_levels,
+            }
+        }
         "list" => CommandAction::ListPlayers,
         "seed" => CommandAction::Seed,
         "biome" => CommandAction::Biome,

@@ -966,7 +966,105 @@ async fn e2e_status_login_config_play_chunks_movement_and_chat() {
     assert!(got_structure_msg, "Did not receive confirmation for /place template igloo/top");
     assert!(got_igloo_snow, "Did not receive minecraft:snow_block BlockUpdate from igloo/top.nbt!");
 
+    // 10. Batch 9 Live E2E: /xp + /weather + 2-block Oak Door placement + level.dat & playerdata/<uuid>.dat persistence!
+    c1.write_raw_packet(&encode_serverbound_chat_command("xp add 55 points"))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("weather thunder"))
+        .await
+        .unwrap();
+    let door_item = ItemStack::from_name("minecraft:oak_door", 1).unwrap();
+    c1.write_raw_packet(&encode_serverbound_set_creative_mode_slot(36, &door_item))
+        .await
+        .unwrap();
+    c1.write_raw_packet(&encode_serverbound_use_item_on(
+        InteractionHand::MainHand,
+        BlockHitResult {
+            pos: BlockPos::new(5, -61, 8),
+            direction: Direction::Up,
+            click_x: 0.5,
+            click_y: 1.0,
+            click_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+        },
+        108,
+    ))
+    .await
+    .unwrap();
+    c1.write_raw_packet(&encode_serverbound_chat_command("save-all"))
+        .await
+        .unwrap();
+
+    let mut got_xp_lvl5 = false;
+    let mut got_thunder_event = false;
+    let mut got_door_lower = false;
+    let mut got_door_upper = false;
+    let mut got_save_confirm = false;
+    for _ in 0..600 {
+        let raw = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            c1.read_raw_packet(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut r = PacketReader::new(&raw);
+        let pid = r.read_varint().unwrap();
+        if pid == packet_ids::play::clientbound::SET_EXPERIENCE {
+            let (pt, _, reenc) =
+                with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+            assert_eq!(pt, "minecraft:set_experience");
+            assert_eq!(reenc, raw);
+            let _prog = r.read_f32().unwrap();
+            let lvl = r.read_varint().unwrap();
+            let tot = r.read_varint().unwrap();
+            if lvl == 5 && tot == 55 {
+                got_xp_lvl5 = true;
+            }
+        } else if pid == packet_ids::play::clientbound::GAME_EVENT {
+            let ev = r.read_u8().unwrap();
+            let val = r.read_f32().unwrap();
+            if ev == 8 && val >= 0.9 {
+                let (pt, _, reenc) =
+                    with_oracle(|o| o.packet_roundtrip("play", "clientbound", &raw)).unwrap();
+                assert_eq!(pt, "minecraft:game_event");
+                assert_eq!(reenc, raw);
+                got_thunder_event = true;
+            }
+        } else if pid == packet_ids::play::clientbound::BLOCK_UPDATE {
+            let pos = r.read_block_pos().unwrap();
+            let st = mc_data::BlockStateId(r.read_varint().unwrap() as u32);
+            if pos == BlockPos::new(5, -60, 8) && st.block_name() == "minecraft:oak_door" {
+                got_door_lower = true;
+            } else if pos == BlockPos::new(5, -59, 8) && st.block_name() == "minecraft:oak_door" {
+                got_door_upper = true;
+            }
+        } else if pid == packet_ids::play::clientbound::SYSTEM_CHAT {
+            if let Ok(mc_nbt::NbtTag::String(s)) = r.read_nbt_network() {
+                if s.contains("level.dat") && s.contains("playerdata") {
+                    got_save_confirm = true;
+                }
+            }
+        }
+        if got_xp_lvl5 && got_thunder_event && got_door_lower && got_door_upper && got_save_confirm {
+            break;
+        }
+    }
+    assert!(got_xp_lvl5, "Expected ClientboundSetExperiencePacket(level=5, total=55)");
+    assert!(got_thunder_event, "Expected GameEvent(THUNDER_LEVEL_CHANGE=1.0)");
+    assert!(got_door_lower && got_door_upper, "Expected both lower and upper halves of oak_door!");
+    assert!(got_save_confirm, "Expected /save-all confirmation with level.dat and playerdata");
+
+    let e2e_world = std::env::temp_dir().join("siliconmc_e2e_world");
+    assert!(e2e_world.join("level.dat").is_file(), "level.dat was not written!");
+    let alice_uuid = mc_proto::offline_player_uuid("Alice");
+    let loaded_alice = mc_server::playerdata::load_player_data(&e2e_world, alice_uuid)
+        .expect("Alice's playerdata/<uuid>.dat was not written!");
+    assert_eq!(loaded_alice.xp_level, 5);
+    assert_eq!(loaded_alice.xp_total, 55);
+
     let _ = shutdown_tx.send(());
     let _ = server_task.await;
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("siliconmc_e2e_world"));
+    let _ = std::fs::remove_dir_all(e2e_world);
 }

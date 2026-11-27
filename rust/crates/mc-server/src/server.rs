@@ -3,12 +3,13 @@ use crate::auth::{ServerKeypair, verify_mojang_session};
 use crate::commands::{self, CommandAction};
 use crate::config::ServerConfig;
 use crate::jsonrpc::JsonRpcServer;
+use crate::playerdata::{SavedPlayerData, add_experience_points, load_player_data, save_player_data};
 use crate::rcon::RconServer;
 use crate::world_loader::{DimensionId, WorldStore};
 use anyhow::Result;
 use mc_data::block_behaviors::{
-    KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_CRAFTING_TABLE, KIND_FURNACE, KIND_HOPPER,
-    KIND_SMOKER, block_behavior,
+    KIND_BARREL, KIND_BLAST_FURNACE, KIND_CHEST, KIND_CRAFTING_TABLE, KIND_END_PORTAL,
+    KIND_FURNACE, KIND_HOPPER, KIND_NETHER_PORTAL, KIND_SMOKER, block_behavior, resolve_placement,
 };
 use mc_data::loot_and_tools::{block_loot, entity_loot, item_combat_stats};
 use mc_data::recipes::{food_info, menu_types};
@@ -27,21 +28,20 @@ use mc_proto::{
     encode_play_chunk_batch_finished, encode_play_chunk_batch_start, encode_play_container_close,
     encode_play_container_set_content, encode_play_container_set_data,
     encode_play_container_set_slot, encode_play_disconnect, encode_play_entity_event,
-    encode_play_entity_position_sync,
-    encode_play_game_event, encode_play_hurt_animation, encode_play_keep_alive,
-    encode_play_level_chunk_with_light, encode_play_light_update, encode_play_open_screen,
-    encode_play_player_abilities, encode_play_player_info_add, encode_play_player_info_remove,
-    encode_play_player_position, encode_play_remove_entities, encode_play_set_chunk_cache_center,
-    encode_play_set_default_spawn, encode_play_set_entity_data, encode_play_set_entity_motion,
-    encode_play_set_health, encode_play_set_held_slot, encode_play_set_time,
-    encode_play_system_chat, encode_play_take_item_entity, encode_status_pong,
-    encode_status_response, offline_player_uuid,
+    encode_play_entity_position_sync, encode_play_game_event, encode_play_hurt_animation,
+    encode_play_keep_alive, encode_play_level_chunk_with_light, encode_play_light_update,
+    encode_play_open_screen, encode_play_player_abilities, encode_play_player_info_add,
+    encode_play_player_info_remove, encode_play_player_position, encode_play_remove_entities,
+    encode_play_set_chunk_cache_center, encode_play_set_default_spawn, encode_play_set_entity_data,
+    encode_play_set_entity_motion, encode_play_set_experience, encode_play_set_health,
+    encode_play_set_held_slot, encode_play_set_time, encode_play_system_chat,
+    encode_play_take_item_entity, encode_status_pong, encode_status_response, offline_player_uuid,
 };
 use mc_world::{
     Arena, BlockEntityKind, ContainerClickType, DirtyLightSections, EntityKind, EntityTickOutcome,
     Handle, ItemStack, PlayerInventory, StructureRotation, StructureTemplate, TickScheduler,
     WorldEntity, apply_container_click, execute_scheduled_tick, interact_block,
-    propagate_neighbor_updates,
+    propagate_neighbor_updates, trigger_pressure_plate,
 };
 use rand::RngCore;
 use std::collections::HashSet;
@@ -99,6 +99,10 @@ struct PlayerEntity {
     saturation: f32,
     food_exhaustion: f32,
     food_tick_timer: u32,
+    xp_level: i32,
+    xp_progress: f32,
+    xp_total: i32,
+    portal_cooldown: u32,
     fall_distance: f64,
     dead: bool,
     last_death: Option<(String, BlockPos)>,
@@ -110,6 +114,27 @@ struct PlayerEntity {
     next_container_id: i32,
     open_menu: Option<OpenMenu>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl PlayerEntity {
+    fn to_saved_data(&self) -> SavedPlayerData {
+        SavedPlayerData {
+            dimension: self.dimension,
+            pos: self.pos,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            gamemode: self.gamemode,
+            health: self.health,
+            food: self.food,
+            saturation: self.saturation,
+            food_exhaustion: self.food_exhaustion,
+            xp_level: self.xp_level,
+            xp_progress: self.xp_progress,
+            xp_total: self.xp_total,
+            selected_hotbar: self.inventory.selected_hotbar,
+            slots: self.inventory.slots.clone(),
+        }
+    }
 }
 
 type PlayerHandle = Handle<PlayerEntity>;
@@ -391,6 +416,31 @@ struct SimState {
 }
 
 impl SimState {
+    fn save_all_players(&self) {
+        let dir = self.world.world_dir();
+        for (_, p) in self.players.iter() {
+            if let Err(e) = save_player_data(dir, p.profile.uuid, &p.to_saved_data()) {
+                warn!("Failed saving playerdata for {}: {e}", p.profile.name);
+            }
+        }
+    }
+
+    fn apply_weather(&mut self, raining: bool, thundering: bool, duration_ticks: i32) {
+        self.world.raining = raining;
+        self.world.rain_time = duration_ticks;
+        self.world.thundering = raining && thundering;
+        self.world.thunder_time = duration_ticks;
+
+        let ev_pkt = encode_play_game_event(if raining { 1 } else { 2 }, 0.0);
+        let rain_pkt = encode_play_game_event(7, if raining { 1.0 } else { 0.0 });
+        let thunder_pkt = encode_play_game_event(8, if raining && thundering { 1.0 } else { 0.0 });
+        for (_, p) in self.players.iter() {
+            let _ = p.tx.send(ev_pkt.clone());
+            let _ = p.tx.send(rain_pkt.clone());
+            let _ = p.tx.send(thunder_pkt.clone());
+        }
+    }
+
     fn alloc_entity_id(&mut self) -> i32 {
         let id = self.next_entity_id;
         self.next_entity_id += 1;
@@ -785,6 +835,63 @@ impl SimState {
                     let short = mname.strip_prefix("minecraft:").unwrap_or(&mname);
                     self.damage_player(ph, 3.0, &format!("was slain by {short}"));
                 }
+            }
+        }
+
+        // 8. Weather countdown & Nether/End portal entry teleportation
+        if self.world.raining && self.world.rain_time > 0 {
+            self.world.rain_time -= 1;
+            if self.world.rain_time == 0 {
+                self.apply_weather(false, false, 24000);
+            }
+        }
+
+        let portal_candidates: Vec<(PlayerHandle, DimensionId, BlockPos)> = self
+            .players
+            .iter_mut()
+            .filter_map(|(ph, p)| {
+                if p.portal_cooldown > 0 {
+                    p.portal_cooldown -= 1;
+                    return None;
+                }
+                if p.dead {
+                    return None;
+                }
+                Some((
+                    ph,
+                    p.dimension,
+                    BlockPos::new(
+                        p.pos.x.floor() as i32,
+                        p.pos.y.floor() as i32,
+                        p.pos.z.floor() as i32,
+                    ),
+                ))
+            })
+            .collect();
+        for (ph, dim, bp) in portal_candidates {
+            let chunk = self.world.get_or_load_chunk_in(dim, bp.chunk_pos());
+            let st = chunk.get_block((bp.x & 15) as usize, bp.y, (bp.z & 15) as usize);
+            let kind = block_behavior(st.0).kind;
+            let target_dim = if kind == KIND_NETHER_PORTAL {
+                Some(if dim == DimensionId::Nether {
+                    DimensionId::Overworld
+                } else {
+                    DimensionId::Nether
+                })
+            } else if kind == KIND_END_PORTAL {
+                Some(if dim == DimensionId::End {
+                    DimensionId::Overworld
+                } else {
+                    DimensionId::End
+                })
+            } else {
+                None
+            };
+            if let Some(tdim) = target_dim {
+                if let Some(p) = self.players.get_mut(ph) {
+                    p.portal_cooldown = 80;
+                }
+                self.switch_dimension(ph, tdim);
             }
         }
     }
@@ -1374,10 +1481,31 @@ impl SimState {
                 )
             }
             CommandAction::Seed => (format!("Seed: [{}]", self.world.seed), false),
-            CommandAction::SaveAll => match self.world.save_dirty_chunks() {
-                Ok(n) => (format!("Saved the game ({n} dirty chunk(s) written to .mca)"), false),
-                Err(e) => (format!("Save failed: {e}"), false),
-            },
+            CommandAction::SaveAll => {
+                self.save_all_players();
+                match self.world.save_dirty_chunks() {
+                    Ok(n) => (
+                        format!("Saved the game ({n} dirty chunk(s), level.dat, and playerdata)"),
+                        false,
+                    ),
+                    Err(e) => (format!("Save failed: {e}"), false),
+                }
+            }
+            CommandAction::SetWeather {
+                raining,
+                thundering,
+                duration_ticks,
+            } => {
+                self.apply_weather(raining, thundering, duration_ticks);
+                let label = if !raining {
+                    "clear"
+                } else if thundering {
+                    "rain & thunder"
+                } else {
+                    "rain"
+                };
+                (format!("Set the weather to {label}"), false)
+            }
             CommandAction::SetTime(ticks) => {
                 self.world.day_time = ticks;
                 let tp = encode_play_set_time(
@@ -1477,6 +1605,7 @@ impl SimState {
                 _ => ("Usage: /whitelist <on|off|list|add|remove> [player]".into(), false),
             },
             CommandAction::StopServer => {
+                self.save_all_players();
                 let _ = self.world.save_dirty_chunks();
                 if let Ok(pkt) = encode_play_system_chat("Stopping the server", false) {
                     for (_, other) in self.players.iter() {
@@ -1526,11 +1655,15 @@ impl SimState {
                     .collect();
                 (Ok(json!(players)), false)
             }
-            "minecraft:server/save" => match self.world.save_dirty_chunks() {
-                Ok(_) => (Ok(json!(true)), false),
-                Err(e) => (Err((-32000, e)), false),
-            },
+            "minecraft:server/save" => {
+                self.save_all_players();
+                match self.world.save_dirty_chunks() {
+                    Ok(_) => (Ok(json!(true)), false),
+                    Err(e) => (Err((-32000, e)), false),
+                }
+            }
             "minecraft:server/stop" => {
+                self.save_all_players();
                 let _ = self.world.save_dirty_chunks();
                 if let Some(sig) = stop_signal.take() {
                     let _ = sig.send(());
@@ -1764,6 +1897,7 @@ fn process_event(
         }
 
         TickEvent::Shutdown { done } => {
+            sim.save_all_players();
             if let Err(e) = sim.world.save_dirty_chunks() {
                 error!("Failed saving dirty chunks on shutdown: {e}");
             }
@@ -1778,15 +1912,69 @@ fn process_event(
             reply,
         } => {
             let entity_id = sim.alloc_entity_id();
-            let gamemode = ctx.config.gamemode;
+            let saved_opt = load_player_data(sim.world.world_dir(), profile.uuid);
 
             let spawn_pos = sim.world.spawn_pos;
-            let spawn_vec = Vec3::new(
+            let default_spawn_vec = Vec3::new(
                 spawn_pos.x as f64 + 0.5,
                 spawn_pos.y as f64,
                 spawn_pos.z as f64 + 0.5,
             );
-            let center_chunk = spawn_pos.chunk_pos();
+            let (
+                dimension,
+                spawn_vec,
+                yaw,
+                pitch,
+                gamemode,
+                health,
+                food,
+                saturation,
+                food_exhaustion,
+                xp_level,
+                xp_progress,
+                xp_total,
+                inventory,
+            ) = if let Some(s) = saved_opt {
+                let mut inv = PlayerInventory::new();
+                inv.slots = s.slots;
+                inv.selected_hotbar = s.selected_hotbar;
+                (
+                    s.dimension,
+                    s.pos,
+                    s.yaw,
+                    s.pitch,
+                    s.gamemode,
+                    s.health,
+                    s.food,
+                    s.saturation,
+                    s.food_exhaustion,
+                    s.xp_level,
+                    s.xp_progress,
+                    s.xp_total,
+                    inv,
+                )
+            } else {
+                (
+                    DimensionId::Overworld,
+                    default_spawn_vec,
+                    0.0_f32,
+                    0.0_f32,
+                    ctx.config.gamemode,
+                    20.0_f32,
+                    20_i32,
+                    5.0_f32,
+                    0.0_f32,
+                    0_i32,
+                    0.0_f32,
+                    0_i32,
+                    PlayerInventory::new(),
+                )
+            };
+
+            let center_chunk = ChunkPos::new(
+                (spawn_vec.x.floor() as i32) >> 4,
+                (spawn_vec.z.floor() as i32) >> 4,
+            );
             let radius = view_distance.min(ctx.config.view_distance).clamp(1, 16);
 
             let login_pkt = PlayLoginPacket {
@@ -1803,8 +1991,8 @@ fn process_event(
                 reduced_debug_info: false,
                 show_death_screen: true,
                 do_limited_crafting: false,
-                dimension_type_id: sim.overworld_dim_id,
-                dimension_name: "minecraft:overworld".into(),
+                dimension_type_id: sim.dim_type_id(dimension),
+                dimension_name: dimension.name().to_string(),
                 hashed_seed: sim.world.hashed_seed,
                 game_type: gamemode,
                 previous_game_type: None,
@@ -1812,15 +2000,15 @@ fn process_event(
                 is_flat: false,
                 last_death_location: None,
                 portal_cooldown: 0,
-                sea_level: 63,
+                sea_level: dimension.sea_level(),
                 online_mode: ctx.config.online_mode,
                 enforces_secure_chat: false,
             };
             let _ = tx.send(login_pkt.encode());
 
-            let inventory = PlayerInventory::new();
             let _ = tx.send(abilities_packet_for_gamemode(gamemode));
-            let _ = tx.send(encode_play_set_health(20.0, 20, 5.0));
+            let _ = tx.send(encode_play_set_health(health, food, saturation));
+            let _ = tx.send(encode_play_set_experience(xp_progress, xp_level, xp_total));
             let _ = tx.send(encode_play_set_held_slot(inventory.selected_hotbar as i32));
             let _ = tx.send(ctx.commands_packet.clone());
             let _ = tx.send(encode_play_set_time(
@@ -1841,6 +2029,13 @@ fn process_event(
                 0.0,
             ));
             let _ = tx.send(encode_play_game_event(13, 0.0));
+            if sim.world.raining {
+                let _ = tx.send(encode_play_game_event(1, 0.0));
+                let _ = tx.send(encode_play_game_event(7, 1.0));
+                if sim.world.thundering {
+                    let _ = tx.send(encode_play_game_event(8, 1.0));
+                }
+            }
             let _ = tx.send(encode_play_set_chunk_cache_center(
                 center_chunk.x,
                 center_chunk.z,
@@ -1852,7 +2047,7 @@ fn process_event(
             for dz in -radius..=radius {
                 for dx in -radius..=radius {
                     let cp = ChunkPos::new(center_chunk.x + dx, center_chunk.z + dz);
-                    let chunk = sim.world.get_or_load_chunk(cp);
+                    let chunk = sim.world.get_or_load_chunk_in(dimension, cp);
                     let _ = tx.send(encode_play_level_chunk_with_light(chunk));
                     loaded_chunks.insert(cp);
                     sent_chunks += 1;
@@ -1864,8 +2059,8 @@ fn process_event(
                 1,
                 spawn_vec,
                 Vec3::ZERO,
-                0.0,
-                0.0,
+                yaw,
+                pitch,
                 0,
             ));
 
@@ -1955,16 +2150,20 @@ fn process_event(
                 entity_id,
                 profile,
                 gamemode,
-                dimension: DimensionId::Overworld,
+                dimension,
                 pos: spawn_vec,
-                yaw: 0.0,
-                pitch: 0.0,
+                yaw,
+                pitch,
                 on_ground: true,
-                health: 20.0,
-                food: 20,
-                saturation: 5.0,
-                food_exhaustion: 0.0,
+                health,
+                food,
+                saturation,
+                food_exhaustion,
                 food_tick_timer: 0,
+                xp_level,
+                xp_progress,
+                xp_total,
+                portal_cooldown: 0,
                 fall_distance: 0.0,
                 dead: false,
                 last_death: None,
@@ -2026,6 +2225,13 @@ fn process_event(
                             p.fall_distance = 0.0;
                         }
                         moved = Some((p.entity_id, p.pos, p.yaw, p.pitch, p.on_ground));
+                        let feet = BlockPos::new(x.floor() as i32, y.floor() as i32, z.floor() as i32);
+                        block_changes.extend(trigger_pressure_plate(
+                            &mut sim.world,
+                            &mut sim.scheduler,
+                            now,
+                            feet,
+                        ));
                     }
                     PlayServerbound::MovePlayerPosRot {
                         x,
@@ -2057,6 +2263,13 @@ fn process_event(
                             p.fall_distance = 0.0;
                         }
                         moved = Some((p.entity_id, p.pos, p.yaw, p.pitch, p.on_ground));
+                        let feet = BlockPos::new(x.floor() as i32, y.floor() as i32, z.floor() as i32);
+                        block_changes.extend(trigger_pressure_plate(
+                            &mut sim.world,
+                            &mut sim.scheduler,
+                            now,
+                            feet,
+                        ));
                     }
                     PlayServerbound::MovePlayerRot {
                         yaw,
@@ -2274,23 +2487,51 @@ fn process_event(
                             } else {
                                 p.inventory.held_item()
                             };
-                            if let Some(place_state) = item.placed_block_state() {
+                            if let Some(default_place) = item.placed_block_state() {
                                 let clicked_state = sim.world.get_block(hit.pos);
-                                let target_pos = if clicked_state.props().can_be_replaced() {
+                                let outcome = resolve_placement(
+                                    default_place.0,
+                                    hit.direction as u8,
+                                    hit.click_y,
+                                    p.yaw,
+                                    p.pitch,
+                                    clicked_state.0,
+                                );
+                                let place_state = BlockStateId(outcome.primary_state);
+                                let target_pos = if outcome.replace_clicked
+                                    || clicked_state.props().can_be_replaced()
+                                {
                                     hit.pos
                                 } else {
                                     hit.direction.offset_pos(hit.pos)
                                 };
                                 let existing = sim.world.get_block(target_pos);
-                                if existing.props().can_be_replaced() {
+                                let sec_ok = outcome.secondary.map_or(true, |(dx, dy, dz, _)| {
+                                    sim.world
+                                        .get_block(target_pos.offset(dx, dy, dz))
+                                        .props()
+                                        .can_be_replaced()
+                                });
+                                if (outcome.replace_clicked || existing.props().can_be_replaced())
+                                    && sec_ok
+                                {
                                     if sim.world.set_block_and_relight(target_pos, place_state).is_some()
                                     {
+                                        let mut seeds = vec![target_pos];
                                         block_changes.push((target_pos, place_state));
+                                        if let Some((dx, dy, dz, sec_id)) = outcome.secondary {
+                                            let sec_pos = target_pos.offset(dx, dy, dz);
+                                            let sec_st = BlockStateId(sec_id);
+                                            if sim.world.set_block_and_relight(sec_pos, sec_st).is_some() {
+                                                block_changes.push((sec_pos, sec_st));
+                                                seeds.push(sec_pos);
+                                            }
+                                        }
                                         block_changes.extend(propagate_neighbor_updates(
                                             &mut sim.world,
                                             &mut sim.scheduler,
                                             now,
-                                            &[target_pos],
+                                            &seeds,
                                         ));
                                         if p.gamemode == 0 {
                                             if let Some((slot_idx, updated)) =
@@ -2476,6 +2717,20 @@ fn process_event(
                                     10,
                                 ));
                             }
+                            // Grant vanilla mob-kill experience (+5 XP)
+                            if let Some(p) = sim.players.get_mut(handle) {
+                                add_experience_points(
+                                    &mut p.xp_level,
+                                    &mut p.xp_progress,
+                                    &mut p.xp_total,
+                                    5,
+                                );
+                                let _ = p.tx.send(encode_play_set_experience(
+                                    p.xp_progress,
+                                    p.xp_level,
+                                    p.xp_total,
+                                ));
+                            }
                         }
                     }
                 } else {
@@ -2623,12 +2878,88 @@ fn process_event(
                         }
                     }
                     CommandAction::SaveAll => {
+                        sim.save_all_players();
                         let msg = match sim.world.save_dirty_chunks() {
-                            Ok(n) => format!("Saved the game ({n} dirty chunk(s) written to .mca)"),
+                            Ok(n) => format!(
+                                "Saved the game ({n} dirty chunk(s), level.dat, and playerdata)"
+                            ),
                             Err(e) => format!("Save failed: {e}"),
                         };
                         if let Some(p) = sim.players.get(handle) {
                             if let Ok(pkt) = encode_play_system_chat(&msg, false) {
+                                let _ = p.tx.send(pkt);
+                            }
+                        }
+                    }
+                    CommandAction::SetWeather {
+                        raining,
+                        thundering,
+                        duration_ticks,
+                    } => {
+                        sim.apply_weather(raining, thundering, duration_ticks);
+                        let label = if !raining {
+                            "clear"
+                        } else if thundering {
+                            "rain & thunder"
+                        } else {
+                            "rain"
+                        };
+                        if let Some(p) = sim.players.get(handle) {
+                            if let Ok(pkt) =
+                                encode_play_system_chat(&format!("Set the weather to {label}"), false)
+                            {
+                                let _ = p.tx.send(pkt);
+                            }
+                        }
+                    }
+                    CommandAction::Xp {
+                        set_mode,
+                        amount,
+                        is_levels,
+                    } => {
+                        if let Some(p) = sim.players.get_mut(handle) {
+                            if set_mode {
+                                if is_levels {
+                                    p.xp_level = amount.max(0);
+                                } else {
+                                    p.xp_level = 0;
+                                    p.xp_progress = 0.0;
+                                    p.xp_total = 0;
+                                    if amount > 0 {
+                                        add_experience_points(
+                                            &mut p.xp_level,
+                                            &mut p.xp_progress,
+                                            &mut p.xp_total,
+                                            amount,
+                                        );
+                                    }
+                                }
+                            } else if is_levels {
+                                p.xp_level = p.xp_level.saturating_add(amount).max(0);
+                                if p.xp_level == 0 && amount < 0 {
+                                    p.xp_progress = 0.0;
+                                    p.xp_total = 0;
+                                }
+                            } else {
+                                add_experience_points(
+                                    &mut p.xp_level,
+                                    &mut p.xp_progress,
+                                    &mut p.xp_total,
+                                    amount,
+                                );
+                            }
+                            let _ = p.tx.send(encode_play_set_experience(
+                                p.xp_progress,
+                                p.xp_level,
+                                p.xp_total,
+                            ));
+                            if let Ok(pkt) = encode_play_system_chat(
+                                &format!(
+                                    "Experience updated: level {} ({} total XP)",
+                                    p.xp_level, p.xp_total
+                                ),
+                                false,
+                            ) {
                                 let _ = p.tx.send(pkt);
                             }
                         }
@@ -2772,6 +3103,7 @@ fn process_event(
                         }
                     }
                     CommandAction::StopServer => {
+                        sim.save_all_players();
                         let _ = sim.world.save_dirty_chunks();
                         if let Ok(pkt) = encode_play_system_chat("Stopping the server", false) {
                             for (_, other) in sim.players.iter() {
@@ -2819,6 +3151,13 @@ fn process_event(
 
         TickEvent::Disconnect { handle } => {
             if let Some(removed) = sim.players.remove(handle) {
+                if let Err(e) = save_player_data(
+                    sim.world.world_dir(),
+                    removed.profile.uuid,
+                    &removed.to_saved_data(),
+                ) {
+                    warn!("Failed saving playerdata for {}: {e}", removed.profile.name);
+                }
                 ctx.online_count
                     .store(sim.players.len() as i32, Ordering::Relaxed);
                 let rm_ent = encode_play_remove_entities(&[removed.entity_id]);

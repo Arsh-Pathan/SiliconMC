@@ -3,6 +3,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod jsonrpc;
+pub mod playerdata;
 pub mod rcon;
 pub mod server;
 pub mod world_loader;
