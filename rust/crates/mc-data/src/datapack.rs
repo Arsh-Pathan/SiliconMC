@@ -73,6 +73,7 @@ impl DynamicRegistry {
 
 #[derive(Debug, Clone)]
 pub struct LoadedDatapacks {
+    pub data_dir: PathBuf,
     pub registries: IndexMap<String, DynamicRegistry>,
 }
 
@@ -121,7 +122,10 @@ impl LoadedDatapacks {
             }
         }
 
-        Ok(Self { registries })
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            registries,
+        })
     }
 
     pub fn biome_id(&self, name: &str) -> u32 {

@@ -1,7 +1,10 @@
 pub mod datapack;
 pub mod generated;
 pub use datapack::*;
-pub use generated::{block_behaviors, block_props, items, loot_and_tools, noises, overworld_biomes, recipes};
+pub use generated::{
+    block_behaviors, block_extra, block_props, gameplay_tables, items, loot_and_tools, mob_spawns,
+    noises, overworld_biomes, recipes,
+};
 
 use block_props::{BLOCK_STATE_NBT_PROPS, BLOCK_STATE_PROPS, BlockStateProps};
 use mc_nbt::{NbtCompound, NbtTag};

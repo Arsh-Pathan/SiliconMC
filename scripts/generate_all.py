@@ -19,8 +19,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 GENERATORS = [
     "gen_rust_tables.py",
     "gen_block_behaviors.py",
+    "gen_blast_and_crops.py",
     "gen_recipes.py",
     "gen_loot_and_tools.py",
+    "gen_gameplay_tables.py",
+    "gen_mob_spawns.py",
     "gen_overworld_density.py",
     "gen_nether_end.py",
     "gen_features.py",
