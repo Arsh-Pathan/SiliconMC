@@ -1087,6 +1087,53 @@ pub fn encode_play_set_experience(progress: f32, level: i32, total_xp: i32) -> V
     w.into_bytes()
 }
 
+/// `ClientboundUpdateMobEffectPacket` (Protocol 777):
+/// flags: bit 0 = ambient, bit 1 = visible, bit 2 = show_icon, bit 3 = blend.
+pub fn encode_play_update_mob_effect(
+    entity_id: i32,
+    effect_id: i32,
+    amplifier: i32,
+    duration_ticks: i32,
+    flags: u8,
+) -> Vec<u8> {
+    let mut w = PacketWriter::new();
+    w.write_varint(packet_ids::play::clientbound::UPDATE_MOB_EFFECT);
+    w.write_varint(entity_id);
+    w.write_varint(effect_id);
+    w.write_varint(amplifier);
+    w.write_varint(duration_ticks);
+    w.write_u8(flags);
+    w.into_bytes()
+}
+
+pub fn encode_play_remove_mob_effect(entity_id: i32, effect_id: i32) -> Vec<u8> {
+    let mut w = PacketWriter::new();
+    w.write_varint(packet_ids::play::clientbound::REMOVE_MOB_EFFECT);
+    w.write_varint(entity_id);
+    w.write_varint(effect_id);
+    w.into_bytes()
+}
+
+/// `ClientboundOpenSignEditorPacket` (26.3: `BlockPos` + `VarInt SignTextSlot` where BACK=0, FRONT=1).
+pub fn encode_play_open_sign_editor(pos: BlockPos, is_front: bool) -> Vec<u8> {
+    let mut w = PacketWriter::new();
+    w.write_varint(packet_ids::play::clientbound::OPEN_SIGN_EDITOR);
+    w.write_block_pos(pos);
+    w.write_varint(if is_front { 1 } else { 0 });
+    w.into_bytes()
+}
+
+/// `ClientboundLevelEventPacket` (particles/sounds such as 2001 = block break particles).
+pub fn encode_play_level_event(event_type: i32, pos: BlockPos, data: i32, global: bool) -> Vec<u8> {
+    let mut w = PacketWriter::new();
+    w.write_varint(packet_ids::play::clientbound::LEVEL_EVENT);
+    w.write_i32(event_type);
+    w.write_block_pos(pos);
+    w.write_i32(data);
+    w.write_bool(global);
+    w.into_bytes()
+}
+
 pub fn encode_play_hurt_animation(entity_id: i32, yaw: f32) -> Vec<u8> {
     let mut w = PacketWriter::new();
     w.write_varint(packet_ids::play::clientbound::HURT_ANIMATION);
@@ -1435,6 +1482,11 @@ pub enum PlayServerbound {
     ClientCommand {
         action: ClientCommandAction,
     },
+    SignUpdate {
+        pos: BlockPos,
+        lines: [String; 4],
+        is_front: bool,
+    },
     ChunkBatchReceived {
         desired_chunks_per_tick: f32,
     },
@@ -1606,6 +1658,18 @@ impl PlayServerbound {
             Ok(Self::ClientCommand {
                 action: ClientCommandAction::from_id(r.read_varint()?)?,
             })
+        } else if id == packet_ids::play::serverbound::SIGN_UPDATE {
+            let pos = r.read_block_pos()?;
+            let l0 = r.read_string(384)?;
+            let l1 = r.read_string(384)?;
+            let l2 = r.read_string(384)?;
+            let l3 = r.read_string(384)?;
+            let slot_id = r.read_varint()?;
+            Ok(Self::SignUpdate {
+                pos,
+                lines: [l0, l1, l2, l3],
+                is_front: slot_id != 0,
+            })
         } else if id == packet_ids::play::serverbound::CHUNK_BATCH_RECEIVED {
             Ok(Self::ChunkBatchReceived {
                 desired_chunks_per_tick: r.read_f32()?,
@@ -1664,6 +1728,21 @@ pub fn encode_serverbound_use_item(
     w.write_varint(sequence);
     w.write_f32(yaw);
     w.write_f32(pitch);
+    w.into_bytes()
+}
+
+pub fn encode_serverbound_sign_update(
+    pos: BlockPos,
+    lines: [&str; 4],
+    is_front: bool,
+) -> Vec<u8> {
+    let mut w = PacketWriter::new();
+    w.write_varint(packet_ids::play::serverbound::SIGN_UPDATE);
+    w.write_block_pos(pos);
+    for l in lines {
+        w.write_string(l);
+    }
+    w.write_varint(if is_front { 1 } else { 0 });
     w.into_bytes()
 }
 
@@ -2275,6 +2354,52 @@ mod tests {
                 sequence: 77,
                 yaw: 45.0,
                 pitch: -10.0,
+            }
+        );
+
+        // 10. Batch 10 MobEffects, Sign Editing (26.3 SignTextSlot), & LevelEvent Packets
+        let regen_id = mc_data::static_registry_protocol_id("minecraft:mob_effect", "minecraft:regeneration").unwrap();
+        assert_oracle_roundtrip(
+            "play",
+            "clientbound",
+            "minecraft:update_mob_effect",
+            &encode_play_update_mob_effect(1, regen_id, 1, 200, 0x06),
+        );
+        assert_oracle_roundtrip(
+            "play",
+            "clientbound",
+            "minecraft:remove_mob_effect",
+            &encode_play_remove_mob_effect(1, regen_id),
+        );
+        assert_oracle_roundtrip(
+            "play",
+            "clientbound",
+            "minecraft:open_sign_editor",
+            &encode_play_open_sign_editor(BlockPos::new(4, -60, 4), true),
+        );
+        assert_oracle_roundtrip(
+            "play",
+            "clientbound",
+            "minecraft:level_event",
+            &encode_play_level_event(2001, BlockPos::new(4, -60, 4), 1, false),
+        );
+        let sign_upd = encode_serverbound_sign_update(
+            BlockPos::new(4, -60, 4),
+            ["SiliconMC", "26.3", "Rust", "1:1"],
+            true,
+        );
+        assert_oracle_roundtrip("play", "serverbound", "minecraft:sign_update", &sign_upd);
+        assert_eq!(
+            PlayServerbound::decode(&sign_upd).unwrap(),
+            PlayServerbound::SignUpdate {
+                pos: BlockPos::new(4, -60, 4),
+                lines: [
+                    "SiliconMC".into(),
+                    "26.3".into(),
+                    "Rust".into(),
+                    "1:1".into()
+                ],
+                is_front: true,
             }
         );
     }
