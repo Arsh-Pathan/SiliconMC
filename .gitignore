@@ -1,0 +1,55 @@
+# ==============================================================================
+# Strictly excluded: Minecraft / Mojang copyrighted source, assets, & data dumps
+# ==============================================================================
+/server.jar
+/pom.xml
+/src/main/java/net/
+/src/main/java/com/mojang/
+/src/main/resources/
+/generated/
+/rust/fixtures/*.bin
+
+# Auto-generated Minecraft-derived Rust data tables (rebuilt via scripts/generate_all.py)
+/rust/crates/mc-data/src/generated/*.rs
+!/rust/crates/mc-data/src/generated/mod.rs
+/rust/crates/mc-worldgen/src/generated_*.rs
+
+# ==============================================================================
+# Build outputs
+# ==============================================================================
+target/
+dependency-reduced-pom.xml
+rust/target/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# ==============================================================================
+# Server runtime files
+# ==============================================================================
+world/
+logs/
+crash-reports/
+debug/
+libraries/
+versions/
+eula.txt
+server.properties
+banned-ips.json
+banned-players.json
+ops.json
+usercache.json
+whitelist.json
+
+# ==============================================================================
+# IDE & OS files
+# ==============================================================================
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.DS_Store
+Thumbs.db
