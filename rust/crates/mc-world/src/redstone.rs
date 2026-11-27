@@ -1,7 +1,8 @@
 use crate::{ScheduledTick, ScheduledTickKind, TickScheduler, fluid_tick_delay, tick_fluid};
 use mc_data::BlockStateId;
 use mc_data::block_behaviors::{
-    KIND_BUTTON, KIND_COMPARATOR, KIND_DOOR, KIND_FALLING_BLOCK, KIND_FENCE_GATE, KIND_LAVA,
+    KIND_ANVIL, KIND_BUTTON, KIND_COMPARATOR, KIND_DISPENSER, KIND_DOOR, KIND_DROPPER,
+    KIND_FALLING_BLOCK, KIND_FENCE_GATE, KIND_LAVA,
     KIND_LEVER, KIND_OBSERVER, KIND_PISTON, KIND_PISTON_HEAD, KIND_PRESSURE_PLATE,
     KIND_REDSTONE_BLOCK, KIND_REDSTONE_LAMP, KIND_REDSTONE_TORCH, KIND_REDSTONE_WIRE,
     KIND_REPEATER, KIND_STICKY_PISTON, KIND_TRAPDOOR, KIND_WATER, PISTON_HEAD_STATES,
@@ -602,7 +603,25 @@ pub fn propagate_neighbor_updates<W: BlockWorld>(
                     }
                 }
             }
-            KIND_FALLING_BLOCK => {
+            KIND_DISPENSER | KIND_DROPPER => {
+                let powered = best_neighbor_signal(world, pos) > 0
+                    || best_neighbor_signal(world, pos.offset(0, 1, 0)) > 0;
+                if powered && !beh.is_powered() {
+                    if let Some(new_id) = beh.toggled_powered() {
+                        let ns = BlockStateId(new_id);
+                        world.set_block_state(pos, ns);
+                        changed.push((pos, ns));
+                    }
+                    scheduler.schedule(current_tick, 4, 0, pos, ScheduledTickKind::DispenserFire);
+                } else if !powered && beh.is_powered() {
+                    if let Some(new_id) = beh.toggled_powered() {
+                        let ns = BlockStateId(new_id);
+                        world.set_block_state(pos, ns);
+                        changed.push((pos, ns));
+                    }
+                }
+            }
+            KIND_FALLING_BLOCK | KIND_ANVIL => {
                 let below = world.get_block_state(pos.offset(0, -1, 0));
                 if below.is_air() || below.props().can_be_replaced() {
                     scheduler.schedule(
@@ -850,8 +869,11 @@ pub fn execute_scheduled_tick<W: BlockWorld>(
                 }
             }
         }
+        ScheduledTickKind::DispenserFire => {
+            // Executed by server loop with full world, block-entity, and entity access.
+        }
         ScheduledTickKind::FallingBlockCheck => {
-            if beh.kind == KIND_FALLING_BLOCK {
+            if beh.kind == KIND_FALLING_BLOCK || beh.kind == KIND_ANVIL {
                 let below = world.get_block_state(tick.pos.offset(0, -1, 0));
                 if below.is_air() || below.props().can_be_replaced() {
                     world.set_block_state(tick.pos, BlockStateId::AIR);
@@ -907,6 +929,10 @@ fn is_piston_immovable(st: BlockStateId) -> bool {
             | "minecraft:smoker"
             | "minecraft:hopper"
             | "minecraft:barrel"
+            | "minecraft:dispenser"
+            | "minecraft:dropper"
+            | "minecraft:brewing_stand"
+            | "minecraft:enchanting_table"
             | "minecraft:spawner"
     )
 }

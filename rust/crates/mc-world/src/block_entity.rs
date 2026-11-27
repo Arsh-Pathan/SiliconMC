@@ -28,6 +28,13 @@ pub enum BlockEntityKind {
         items: Vec<ItemStack>, // 5 slots
         transfer_cooldown: i32,
     },
+    BrewingStand {
+        state: crate::BrewingStandState,
+    },
+    Dispenser {
+        is_dropper: bool,
+        items: Vec<ItemStack>, // 9 slots
+    },
     Sign {
         front_lines: [String; 4],
         back_lines: [String; 4],
@@ -97,6 +104,25 @@ impl BlockEntity {
         }
     }
 
+    pub fn new_brewing_stand(pos: BlockPos) -> Self {
+        Self {
+            pos,
+            kind: BlockEntityKind::BrewingStand {
+                state: crate::BrewingStandState::new(),
+            },
+        }
+    }
+
+    pub fn new_dispenser(pos: BlockPos, is_dropper: bool) -> Self {
+        Self {
+            pos,
+            kind: BlockEntityKind::Dispenser {
+                is_dropper,
+                items: vec![ItemStack::EMPTY; 9],
+            },
+        }
+    }
+
     pub fn new_sign(pos: BlockPos) -> Self {
         Self {
             pos,
@@ -118,6 +144,14 @@ impl BlockEntity {
                 _ => "minecraft:furnace",
             },
             BlockEntityKind::Hopper { .. } => "minecraft:hopper",
+            BlockEntityKind::BrewingStand { .. } => "minecraft:brewing_stand",
+            BlockEntityKind::Dispenser { is_dropper, .. } => {
+                if *is_dropper {
+                    "minecraft:dropper"
+                } else {
+                    "minecraft:dispenser"
+                }
+            }
             BlockEntityKind::Sign { .. } => "minecraft:sign",
             BlockEntityKind::Raw { id, .. } => id.as_str(),
         }
@@ -133,6 +167,12 @@ impl BlockEntity {
                 _ => block_entity_types::FURNACE,
             }),
             BlockEntityKind::Hopper { .. } => Some(block_entity_types::HOPPER),
+            BlockEntityKind::BrewingStand { .. } => Some(block_entity_types::BREWING_STAND),
+            BlockEntityKind::Dispenser { is_dropper, .. } => Some(if *is_dropper {
+                block_entity_types::DROPPER
+            } else {
+                block_entity_types::DISPENSER
+            }),
             BlockEntityKind::Sign { .. } => Some(block_entity_types::SIGN),
             BlockEntityKind::Raw { id, .. } => {
                 mc_data::static_registry_protocol_id("minecraft:block_entity_type", id)
@@ -145,7 +185,9 @@ impl BlockEntity {
             BlockEntityKind::Chest { items }
             | BlockEntityKind::Barrel { items }
             | BlockEntityKind::Furnace { items, .. }
-            | BlockEntityKind::Hopper { items, .. } => Some(items),
+            | BlockEntityKind::Hopper { items, .. }
+            | BlockEntityKind::Dispenser { items, .. } => Some(items),
+            BlockEntityKind::BrewingStand { state } => Some(&state.slots),
             BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => None,
         }
     }
@@ -155,7 +197,9 @@ impl BlockEntity {
             BlockEntityKind::Chest { items }
             | BlockEntityKind::Barrel { items }
             | BlockEntityKind::Furnace { items, .. }
-            | BlockEntityKind::Hopper { items, .. } => Some(items),
+            | BlockEntityKind::Hopper { items, .. }
+            | BlockEntityKind::Dispenser { items, .. } => Some(items),
+            BlockEntityKind::BrewingStand { state } => Some(&mut state.slots),
             BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => None,
         }
     }
@@ -202,7 +246,15 @@ impl BlockEntity {
             }
             BlockEntityKind::Chest { items }
             | BlockEntityKind::Barrel { items }
-            | BlockEntityKind::Hopper { items, .. } => (0..items.len()).collect(),
+            | BlockEntityKind::Hopper { items, .. }
+            | BlockEntityKind::Dispenser { items, .. } => (0..items.len()).collect(),
+            BlockEntityKind::BrewingStand { .. } => {
+                if from_top {
+                    vec![3]
+                } else {
+                    vec![0, 1, 2, 4]
+                }
+            }
             BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => return false,
         };
         let Some(slots) = self.items_slice_mut() else {
@@ -237,7 +289,9 @@ impl BlockEntity {
             BlockEntityKind::Furnace { .. } => vec![2],
             BlockEntityKind::Chest { items }
             | BlockEntityKind::Barrel { items }
-            | BlockEntityKind::Hopper { items, .. } => (0..items.len()).collect(),
+            | BlockEntityKind::Hopper { items, .. }
+            | BlockEntityKind::Dispenser { items, .. } => (0..items.len()).collect(),
+            BlockEntityKind::BrewingStand { .. } => vec![0, 1, 2],
             BlockEntityKind::Sign { .. } | BlockEntityKind::Raw { .. } => return None,
         };
         let slots = self.items_slice_mut()?;
@@ -421,6 +475,17 @@ impl BlockEntity {
                 c.insert("TransferCooldown", NbtTag::Int(*transfer_cooldown));
                 c.insert("Items", save_items_nbt(items));
             }
+            BlockEntityKind::BrewingStand { state } => {
+                let mut bn = state.save_to_nbt();
+                bn.insert("x", NbtTag::Int(self.pos.x));
+                bn.insert("y", NbtTag::Int(self.pos.y));
+                bn.insert("z", NbtTag::Int(self.pos.z));
+                bn.insert("keepPacked", NbtTag::Byte(0));
+                return bn;
+            }
+            BlockEntityKind::Dispenser { items, .. } => {
+                c.insert("Items", save_items_nbt(items));
+            }
             BlockEntityKind::Sign {
                 front_lines,
                 back_lines,
@@ -471,6 +536,17 @@ impl BlockEntity {
             "minecraft:hopper" => BlockEntityKind::Hopper {
                 items: load_items_nbt(c, 5),
                 transfer_cooldown: c.get_int("TransferCooldown").unwrap_or(0),
+            },
+            "minecraft:brewing_stand" => BlockEntityKind::BrewingStand {
+                state: crate::BrewingStandState::load_from_nbt(c),
+            },
+            "minecraft:dispenser" => BlockEntityKind::Dispenser {
+                is_dropper: false,
+                items: load_items_nbt(c, 9),
+            },
+            "minecraft:dropper" => BlockEntityKind::Dispenser {
+                is_dropper: true,
+                items: load_items_nbt(c, 9),
             },
             "minecraft:sign" | "minecraft:hanging_sign" => BlockEntityKind::Sign {
                 front_lines: load_sign_text_nbt(c.get_compound("front_text")),

@@ -59,6 +59,8 @@ def classify_kind(block_name: str, props: dict[str, str]) -> int:
         return 10
     if block_name == "minecraft:redstone_block":
         return 11
+    if block_name in ("minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil"):
+        return 33
     if block_name in FALLING_BLOCKS or block_name.endswith("_concrete_powder"):
         return 12
     if block_name in ("minecraft:chest", "minecraft:trapped_chest"):
@@ -99,6 +101,16 @@ def classify_kind(block_name: str, props: dict[str, str]) -> int:
         return 30
     if block_name.endswith("_sign"):
         return 31
+    if block_name == "minecraft:enchanting_table":
+        return 32
+    if block_name == "minecraft:brewing_stand":
+        return 34
+    if block_name == "minecraft:smithing_table":
+        return 35
+    if block_name == "minecraft:stonecutter":
+        return 36
+    if block_name.endswith("_bed") and "part" in props:
+        return 37
     return 0
 
 
@@ -378,6 +390,12 @@ def main() -> None:
         "pub const KIND_NETHER_PORTAL: u8 = 29;",
         "pub const KIND_END_PORTAL: u8 = 30;",
         "pub const KIND_SIGN: u8 = 31;",
+        "pub const KIND_ENCHANTING_TABLE: u8 = 32;",
+        "pub const KIND_ANVIL: u8 = 33;",
+        "pub const KIND_BREWING_STAND: u8 = 34;",
+        "pub const KIND_SMITHING_TABLE: u8 = 35;",
+        "pub const KIND_STONECUTTER: u8 = 36;",
+        "pub const KIND_BED: u8 = 37;",
         "",
         f"pub const WATER_STATES: [u32; 16] = [{', '.join(str(x) for x in water_states)}];",
         f"pub const LAVA_STATES: [u32; 16] = [{', '.join(str(x) for x in lava_states)}];",

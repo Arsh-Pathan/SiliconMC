@@ -12,6 +12,7 @@ pub enum ScheduledTickKind {
     ObserverPulseStart,
     ObserverPulseEnd,
     PressurePlateRelease,
+    DispenserFire,
     FallingBlockCheck,
     FluidTick,
 }
