@@ -1,0 +1,28 @@
+[package]
+name = "mc-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mc-math.workspace = true
+mc-nbt.workspace = true
+mc-data.workspace = true
+mc-world.workspace = true
+mc-worldgen.workspace = true
+mc-proto.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+flate2.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+mc-oracle.workspace = true
